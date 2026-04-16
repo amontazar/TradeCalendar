@@ -203,6 +203,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private bool isApplyingUiState;
         private bool isRefreshingFilterChoices;
         private string pendingDefaultAccountName;
+        private string preferredAccountName;
 
         private readonly Brush positiveBrush = new SolidColorBrush(Color.FromRgb(56, 142, 60));
         private readonly Brush negativeBrush = new SolidColorBrush(Color.FromRgb(198, 40, 40));
@@ -253,6 +254,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
 
             RefreshAll();
+            Dispatcher.InvokeAsync(() =>
+            {
+                TryApplyPendingDefaultAccountSelection();
+                RefreshAll();
+            });
         }
 
         private void OnUnloaded(object sender, RoutedEventArgs e)
@@ -470,6 +476,12 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnAccountSelectionChanged(object sender, SelectionChangedEventArgs e)
         {
+            if (accountSelector != null && accountSelector.SelectedAccount != null)
+            {
+                preferredAccountName = accountSelector.SelectedAccount.Name;
+                pendingDefaultAccountName = null;
+            }
+
             RefreshFilterChoices();
             OnAnyFilterChanged(sender, e);
         }
@@ -614,6 +626,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             pendingDefaultAccountName = !string.IsNullOrWhiteSpace(state.LastSelectedAccountName)
                 ? state.LastSelectedAccountName
                 : state.AccountName;
+            preferredAccountName = pendingDefaultAccountName;
             TryApplyPendingDefaultAccountSelection();
 
             ApplyComboSelection(sourceComboBox, string.IsNullOrWhiteSpace(state.SourceFilter) ? AllSourcesText : state.SourceFilter);
@@ -640,11 +653,18 @@ namespace NinjaTrader.NinjaScript.AddOns
                     ? accountSelector.SelectedAccount.Name
                     : string.Empty;
 
+                if (!string.IsNullOrWhiteSpace(selectedAccountName))
+                    preferredAccountName = selectedAccountName;
+
+                string persistedDefaultAccountName = !string.IsNullOrWhiteSpace(pendingDefaultAccountName)
+                    ? pendingDefaultAccountName
+                    : (preferredAccountName ?? string.Empty);
+
                 TradeCalendarUiState state = new TradeCalendarUiState
                 {
-                    AccountName = allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true ? string.Empty : selectedAccountName,
+                    AccountName = allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true ? string.Empty : persistedDefaultAccountName,
                     AllAccounts = allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true,
-                    LastSelectedAccountName = selectedAccountName,
+                    LastSelectedAccountName = persistedDefaultAccountName,
                     InstrumentFilter = GetComboSelection(instrumentComboBox, AllInstrumentsText),
                     SourceFilter = GetComboSelection(sourceComboBox, AllSourcesText),
                     SideFilter = GetComboSelection(sideComboBox, AllSidesText),
@@ -688,8 +708,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (savedAccount == null)
                 return;
 
-            pendingDefaultAccountName = null;
             accountSelector.SelectedAccount = savedAccount;
+            preferredAccountName = savedAccount.Name;
+
+            if (accountSelector.SelectedAccount != null
+                && string.Equals(accountSelector.SelectedAccount.Name, savedAccount.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                pendingDefaultAccountName = null;
+            }
         }
 
         private string GetComboSelection(ComboBox combo, string defaultLabel)
