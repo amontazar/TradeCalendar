@@ -202,6 +202,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private DateTime selectedDate;
         private bool isApplyingUiState;
         private bool isRefreshingFilterChoices;
+        private string pendingDefaultAccountName;
 
         private readonly Brush positiveBrush = new SolidColorBrush(Color.FromRgb(56, 142, 60));
         private readonly Brush negativeBrush = new SolidColorBrush(Color.FromRgb(198, 40, 40));
@@ -265,6 +266,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             Dispatcher.InvokeAsync(() =>
             {
                 RefreshFilterChoices();
+                TryApplyPendingDefaultAccountSelection();
                 RefreshAll();
             });
         }
@@ -587,6 +589,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     instrumentComboBox.SelectedIndex = 0;
 
                 accountSelector.IsEnabled = allAccountsCheckBox.IsChecked != true;
+                TryApplyPendingDefaultAccountSelection();
             }
             finally
             {
@@ -608,9 +611,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             allAccountsCheckBox.IsChecked = state.AllAccounts;
             accountSelector.IsEnabled = !state.AllAccounts;
 
-            Account savedAccount = FindAccountByName(state.AccountName);
-            if (savedAccount != null)
-                accountSelector.SelectedAccount = savedAccount;
+            pendingDefaultAccountName = !string.IsNullOrWhiteSpace(state.LastSelectedAccountName)
+                ? state.LastSelectedAccountName
+                : state.AccountName;
+            TryApplyPendingDefaultAccountSelection();
 
             ApplyComboSelection(sourceComboBox, string.IsNullOrWhiteSpace(state.SourceFilter) ? AllSourcesText : state.SourceFilter);
             ApplyComboSelection(sideComboBox, string.IsNullOrWhiteSpace(state.SideFilter) ? AllSidesText : state.SideFilter);
@@ -632,10 +636,15 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             try
             {
+                string selectedAccountName = accountSelector != null && accountSelector.SelectedAccount != null
+                    ? accountSelector.SelectedAccount.Name
+                    : string.Empty;
+
                 TradeCalendarUiState state = new TradeCalendarUiState
                 {
-                    AccountName = allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true ? string.Empty : GetSelectedAccountName() ?? string.Empty,
+                    AccountName = allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true ? string.Empty : selectedAccountName,
                     AllAccounts = allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true,
+                    LastSelectedAccountName = selectedAccountName,
                     InstrumentFilter = GetComboSelection(instrumentComboBox, AllInstrumentsText),
                     SourceFilter = GetComboSelection(sourceComboBox, AllSourcesText),
                     SideFilter = GetComboSelection(sideComboBox, AllSidesText),
@@ -668,6 +677,19 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (combo.Items.Count > 0)
                 combo.SelectedIndex = 0;
+        }
+
+        private void TryApplyPendingDefaultAccountSelection()
+        {
+            if (string.IsNullOrWhiteSpace(pendingDefaultAccountName) || accountSelector == null)
+                return;
+
+            Account savedAccount = FindAccountByName(pendingDefaultAccountName);
+            if (savedAccount == null)
+                return;
+
+            pendingDefaultAccountName = null;
+            accountSelector.SelectedAccount = savedAccount;
         }
 
         private string GetComboSelection(ComboBox combo, string defaultLabel)
@@ -2992,6 +3014,7 @@ namespace NinjaTrader.NinjaScript.AddOns
     {
         public string AccountName { get; set; }
         public bool AllAccounts { get; set; }
+        public string LastSelectedAccountName { get; set; }
         public string InstrumentFilter { get; set; }
         public string SourceFilter { get; set; }
         public string SideFilter { get; set; }
