@@ -21,6 +21,7 @@ using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using System.Xml.Linq;
 using System.Xml.Serialization;
 using Microsoft.Win32;
@@ -204,6 +205,19 @@ namespace NinjaTrader.NinjaScript.AddOns
         private bool isRefreshingFilterChoices;
         private string pendingDefaultAccountName;
         private string preferredAccountName;
+        private int? pendingDefaultAccountIndex;
+        private int? preferredAccountIndex;
+        private DispatcherTimer pendingAccountRestoreTimer;
+        private int pendingAccountRestoreAttempts;
+        private DateTime lastAccountSelectorInteractionUtc;
+        private bool isStartupAccountRestorePhase;
+        private int startupStableTicks;
+        private bool isRestoringAccountSelection;
+        private bool isApplyingCommittedUserAccountSelection;
+
+        private const int PendingAccountRestoreMaxAttempts = 80;
+        private static readonly TimeSpan PendingAccountRestoreInterval = TimeSpan.FromMilliseconds(250);
+        private const int StartupStableTickThreshold = 4;
 
         private readonly Brush positiveBrush = new SolidColorBrush(Color.FromRgb(56, 142, 60));
         private readonly Brush negativeBrush = new SolidColorBrush(Color.FromRgb(198, 40, 40));
@@ -238,6 +252,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnLoaded(object sender, RoutedEventArgs e)
         {
+            isStartupAccountRestorePhase = true;
+            startupStableTicks = 0;
             service.DataChanged += OnServiceDataChanged;
             service.EnsureInitialized();
             service.RefreshCurrentSessionSnapshots();
@@ -254,15 +270,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
 
             RefreshAll();
-            Dispatcher.InvokeAsync(() =>
-            {
-                TryApplyPendingDefaultAccountSelection();
-                RefreshAll();
-            });
+            StartPendingAccountRestoreLoop();
         }
 
         private void OnUnloaded(object sender, RoutedEventArgs e)
         {
+            isStartupAccountRestorePhase = false;
+            startupStableTicks = 0;
+            StopPendingAccountRestoreLoop();
             service.DataChanged -= OnServiceDataChanged;
             SaveCurrentUiState();
         }
@@ -273,6 +288,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 RefreshFilterChoices();
                 TryApplyPendingDefaultAccountSelection();
+                StartPendingAccountRestoreLoop();
                 RefreshAll();
             });
         }
@@ -372,6 +388,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                 VerticalAlignment = VerticalAlignment.Center
             };
             accountSelector.SelectionChanged += OnAccountSelectionChanged;
+            accountSelector.PreviewMouseDown += OnAccountSelectorInteracted;
+            accountSelector.PreviewKeyDown += OnAccountSelectorInteracted;
+            accountSelector.LostKeyboardFocus += (s, e) => CommitAccountSelection();
+            accountSelector.LostFocus += (s, e) => CommitAccountSelection();
 
             allAccountsCheckBox = new CheckBox
             {
@@ -476,14 +496,117 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnAccountSelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (accountSelector != null && accountSelector.SelectedAccount != null)
+            if (isApplyingCommittedUserAccountSelection)
+                return;
+
+            bool likelyUserInitiated = IsLikelyUserAccountInteraction();
+            string selectedAccountName = GetAccountNameFromSelectionArgs(e)
+                ?? ResolveAccountName(CurrentAccountSelectionName())
+                ?? CurrentAccountSelectionName();
+            int? selectedAccountIndex = CurrentAccountSelectionIndex();
+
+            if (likelyUserInitiated && !string.IsNullOrWhiteSpace(selectedAccountName) && !isRestoringAccountSelection)
             {
-                preferredAccountName = accountSelector.SelectedAccount.Name;
+                QueueCommittedUserAccountSelection(selectedAccountName);
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(selectedAccountName))
+            {
+                if (isRestoringAccountSelection && !likelyUserInitiated)
+                {
+                    RefreshFilterChoices();
+                    RefreshAll();
+                    return;
+                }
+
+                if (isStartupAccountRestorePhase && !likelyUserInitiated && !string.IsNullOrWhiteSpace(preferredAccountName)
+                    && !string.Equals(selectedAccountName, preferredAccountName, StringComparison.OrdinalIgnoreCase))
+                {
+                    pendingDefaultAccountName = preferredAccountName;
+                    StartPendingAccountRestoreLoop();
+                    TryApplyPendingDefaultAccountSelection();
+                    RefreshFilterChoices();
+                    RefreshAll();
+                    return;
+                }
+
+                preferredAccountName = selectedAccountName;
+                preferredAccountIndex = selectedAccountIndex;
                 pendingDefaultAccountName = null;
+                pendingDefaultAccountIndex = null;
+                StopPendingAccountRestoreLoop();
             }
 
             RefreshFilterChoices();
             OnAnyFilterChanged(sender, e);
+        }
+
+        private void OnAccountSelectorInteracted(object sender, InputEventArgs e)
+        {
+            lastAccountSelectorInteractionUtc = DateTime.UtcNow;
+        }
+        private string GetAccountNameFromSelectionArgs(SelectionChangedEventArgs e)
+        {
+            if (e == null || e.AddedItems == null || e.AddedItems.Count == 0)
+                return null;
+
+            foreach (object item in e.AddedItems)
+            {
+                string itemName = GetAccountNameFromItem(item);
+                if (!string.IsNullOrWhiteSpace(itemName))
+                    return ResolveAccountName(itemName) ?? itemName;
+            }
+
+            return null;
+        }
+
+        private void QueueCommittedUserAccountSelection(string accountName)
+        {
+            string requestedAccountName = ResolveAccountName(accountName) ?? accountName;
+            if (string.IsNullOrWhiteSpace(requestedAccountName))
+                return;
+
+            Dispatcher.InvokeAsync(() => ApplyCommittedUserAccountSelection(requestedAccountName), DispatcherPriority.Background);
+        }
+
+        private void ApplyCommittedUserAccountSelection(string accountName)
+        {
+            string requestedAccountName = ResolveAccountName(accountName) ?? accountName;
+            if (string.IsNullOrWhiteSpace(requestedAccountName) || accountSelector == null)
+                return;
+
+            isApplyingCommittedUserAccountSelection = true;
+            isRestoringAccountSelection = true;
+            try
+            {
+                TrySelectAccountByName(requestedAccountName);
+                TrySetAccountSelectorDisplayText(requestedAccountName);
+                preferredAccountName = requestedAccountName;
+                preferredAccountIndex = CurrentAccountSelectionIndex();
+                pendingDefaultAccountName = null;
+                pendingDefaultAccountIndex = null;
+                isStartupAccountRestorePhase = false;
+                startupStableTicks = 0;
+                StopPendingAccountRestoreLoop();
+            }
+            finally
+            {
+                isRestoringAccountSelection = false;
+                isApplyingCommittedUserAccountSelection = false;
+            }
+
+            SaveCurrentUiState();
+            RefreshFilterChoices();
+            RefreshAll();
+        }
+
+        private void CommitAccountSelection()
+        {
+            if (isApplyingUiState || isRefreshingFilterChoices || isRestoringAccountSelection)
+                return;
+
+            SaveCurrentUiState();
         }
 
         private void OnAnyFilterChanged(object sender, RoutedEventArgs e)
@@ -493,6 +616,13 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (accountSelector != null && allAccountsCheckBox != null)
                 accountSelector.IsEnabled = allAccountsCheckBox.IsChecked != true;
+
+            bool protectStartupStateFromDrift = isStartupAccountRestorePhase && !IsLikelyUserAccountInteraction();
+            if (protectStartupStateFromDrift)
+            {
+                RefreshAll();
+                return;
+            }
 
             SaveCurrentUiState();
             RefreshAll();
@@ -626,8 +756,19 @@ namespace NinjaTrader.NinjaScript.AddOns
             pendingDefaultAccountName = !string.IsNullOrWhiteSpace(state.LastSelectedAccountName)
                 ? state.LastSelectedAccountName
                 : state.AccountName;
+
+            // Account list ordering is not stable across NinjaTrader sessions,
+            // so a persisted index can point at the wrong Apex account next time.
+            // Restore by account name first and only use the saved index when no name exists.
+            pendingDefaultAccountIndex = string.IsNullOrWhiteSpace(pendingDefaultAccountName)
+                ? state.LastSelectedAccountIndex
+                : null;
+
             preferredAccountName = pendingDefaultAccountName;
+            preferredAccountIndex = pendingDefaultAccountIndex;
             TryApplyPendingDefaultAccountSelection();
+            StartPendingAccountRestoreLoop();
+            NinjaTrader.Code.Output.Process("TradeCalendar loaded account='" + (pendingDefaultAccountName ?? preferredAccountName ?? string.Empty) + "'", PrintTo.OutputTab1);
 
             ApplyComboSelection(sourceComboBox, string.IsNullOrWhiteSpace(state.SourceFilter) ? AllSourcesText : state.SourceFilter);
             ApplyComboSelection(sideComboBox, string.IsNullOrWhiteSpace(state.SideFilter) ? AllSidesText : state.SideFilter);
@@ -649,22 +790,39 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             try
             {
-                string selectedAccountName = accountSelector != null && accountSelector.SelectedAccount != null
-                    ? accountSelector.SelectedAccount.Name
-                    : string.Empty;
+                string selectedAccountName = GetPersistableAccountSelectionName() ?? string.Empty;
+                int? selectedAccountIndex = null;
+                bool protectStartupStateFromDrift = isStartupAccountRestorePhase && !IsLikelyUserAccountInteraction();
 
-                if (!string.IsNullOrWhiteSpace(selectedAccountName))
+                if (!protectStartupStateFromDrift && !string.IsNullOrWhiteSpace(selectedAccountName))
+                {
                     preferredAccountName = selectedAccountName;
+                    preferredAccountIndex = selectedAccountIndex;
+                }
+                else if (string.IsNullOrWhiteSpace(preferredAccountName) && !string.IsNullOrWhiteSpace(selectedAccountName))
+                {
+                    preferredAccountName = selectedAccountName;
+                    preferredAccountIndex = selectedAccountIndex;
+                }
 
                 string persistedDefaultAccountName = !string.IsNullOrWhiteSpace(pendingDefaultAccountName)
                     ? pendingDefaultAccountName
-                    : (preferredAccountName ?? string.Empty);
+                    : (!string.IsNullOrWhiteSpace(preferredAccountName) ? preferredAccountName : selectedAccountName);
+
+                // Persist the name as the authoritative restore key.
+                // The index is only useful as a last-resort fallback when no name is available.
+                int? persistedDefaultAccountIndex = string.IsNullOrWhiteSpace(persistedDefaultAccountName)
+                    ? (pendingDefaultAccountIndex.HasValue
+                        ? pendingDefaultAccountIndex
+                        : (preferredAccountIndex.HasValue ? preferredAccountIndex : selectedAccountIndex))
+                    : null;
 
                 TradeCalendarUiState state = new TradeCalendarUiState
                 {
                     AccountName = allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true ? string.Empty : persistedDefaultAccountName,
                     AllAccounts = allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true,
                     LastSelectedAccountName = persistedDefaultAccountName,
+                    LastSelectedAccountIndex = persistedDefaultAccountIndex,
                     InstrumentFilter = GetComboSelection(instrumentComboBox, AllInstrumentsText),
                     SourceFilter = GetComboSelection(sourceComboBox, AllSourcesText),
                     SideFilter = GetComboSelection(sideComboBox, AllSidesText),
@@ -675,6 +833,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     SelectedDate = selectedDate
                 };
                 state.Save();
+                NinjaTrader.Code.Output.Process("TradeCalendar saved account='" + (persistedDefaultAccountName ?? string.Empty) + "' display='" + (GetAccountSelectorDisplayText() ?? string.Empty) + "'", PrintTo.OutputTab1);
             }
             catch
             {
@@ -701,20 +860,31 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void TryApplyPendingDefaultAccountSelection()
         {
-            if (string.IsNullOrWhiteSpace(pendingDefaultAccountName) || accountSelector == null)
+            if (accountSelector == null)
                 return;
 
-            Account savedAccount = FindAccountByName(pendingDefaultAccountName);
-            if (savedAccount == null)
+            string targetAccountName = ResolveAccountName(pendingDefaultAccountName)
+                ?? ResolveAccountName(preferredAccountName)
+                ?? ResolveAccountName(GetAccountSelectorDisplayText());
+
+            if (string.IsNullOrWhiteSpace(targetAccountName))
                 return;
 
-            accountSelector.SelectedAccount = savedAccount;
-            preferredAccountName = savedAccount.Name;
-
-            if (accountSelector.SelectedAccount != null
-                && string.Equals(accountSelector.SelectedAccount.Name, savedAccount.Name, StringComparison.OrdinalIgnoreCase))
+            isRestoringAccountSelection = true;
+            try
             {
+                if (!TrySelectAccountByName(targetAccountName))
+                    return;
+
+                TrySetAccountSelectorDisplayText(targetAccountName);
+                preferredAccountName = targetAccountName;
+                preferredAccountIndex = CurrentAccountSelectionIndex();
                 pendingDefaultAccountName = null;
+                pendingDefaultAccountIndex = null;
+            }
+            finally
+            {
+                isRestoringAccountSelection = false;
             }
         }
 
@@ -1180,9 +1350,263 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true)
                 return null;
 
-            return accountSelector != null && accountSelector.SelectedAccount != null
-                ? accountSelector.SelectedAccount.Name
-                : null;
+            if (!string.IsNullOrWhiteSpace(preferredAccountName))
+                return preferredAccountName;
+
+            if (!string.IsNullOrWhiteSpace(pendingDefaultAccountName))
+                return pendingDefaultAccountName;
+
+            string selectedAccountName = CurrentAccountSelectionName();
+            if (!string.IsNullOrWhiteSpace(selectedAccountName))
+                return selectedAccountName;
+
+            return null;
+        }
+
+        private string GetPersistableAccountSelectionName()
+        {
+            string displayText = GetAccountSelectorDisplayText();
+            if (!string.IsNullOrWhiteSpace(displayText))
+            {
+                string matched = ResolveAccountName(displayText);
+                if (!string.IsNullOrWhiteSpace(matched))
+                    return matched;
+            }
+
+            string selectedName = CurrentAccountSelectionName();
+            if (!string.IsNullOrWhiteSpace(selectedName))
+                return ResolveAccountName(selectedName) ?? selectedName;
+
+            if (!string.IsNullOrWhiteSpace(preferredAccountName))
+                return ResolveAccountName(preferredAccountName) ?? preferredAccountName;
+
+            return null;
+        }
+
+        private string CurrentAccountSelectionName()
+        {
+            if (accountSelector == null)
+                return null;
+
+            if (accountSelector.SelectedAccount != null && !string.IsNullOrWhiteSpace(accountSelector.SelectedAccount.Name))
+                return accountSelector.SelectedAccount.Name;
+
+            string selectedItemName = GetAccountNameFromItem(accountSelector.SelectedItem);
+            if (!string.IsNullOrWhiteSpace(selectedItemName))
+                return selectedItemName;
+
+            string displayText = GetAccountSelectorDisplayText();
+            if (!string.IsNullOrWhiteSpace(displayText))
+                return displayText;
+
+            return null;
+        }
+
+        private int? CurrentAccountSelectionIndex()
+        {
+            if (accountSelector == null)
+                return null;
+
+            return accountSelector.SelectedIndex >= 0 ? (int?)accountSelector.SelectedIndex : null;
+        }
+
+        private string ResolveAccountName(string accountName)
+        {
+            if (string.IsNullOrWhiteSpace(accountName))
+                return null;
+
+            string trimmed = accountName.Trim();
+
+            if (accountSelector != null)
+            {
+                foreach (object item in accountSelector.Items)
+                {
+                    string itemName = GetAccountNameFromItem(item);
+                    if (string.Equals(itemName, trimmed, StringComparison.OrdinalIgnoreCase))
+                        return itemName;
+                }
+            }
+
+            Account knownAccount = FindAccountByName(trimmed);
+            if (knownAccount != null && !string.IsNullOrWhiteSpace(knownAccount.Name))
+                return knownAccount.Name;
+
+            return null;
+        }
+
+        private bool TrySelectAccountByIndex(int index)
+        {
+            if (accountSelector == null || index < 0 || index >= accountSelector.Items.Count)
+                return false;
+
+            accountSelector.SelectedIndex = index;
+            int? current = CurrentAccountSelectionIndex();
+            return current.HasValue && current.Value == index;
+        }
+
+        private bool TrySelectAccountByName(string accountName)
+        {
+            if (string.IsNullOrWhiteSpace(accountName) || accountSelector == null)
+                return false;
+
+            string target = ResolveAccountName(accountName) ?? accountName.Trim();
+
+            for (int i = 0; i < accountSelector.Items.Count; i++)
+            {
+                object item = accountSelector.Items[i];
+                string itemName = GetAccountNameFromItem(item);
+                if (!string.Equals(itemName, target, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                accountSelector.SelectedIndex = i;
+                accountSelector.SelectedItem = item;
+                Account accountItem = item as Account;
+                if (accountItem != null)
+                    accountSelector.SelectedAccount = accountItem;
+                TrySetAccountSelectorDisplayText(target);
+                return IsAccountSelectionByName(target) || string.Equals(GetAccountSelectorDisplayText(), target, StringComparison.OrdinalIgnoreCase);
+            }
+
+            Account knownAccount = FindAccountByName(target);
+            if (knownAccount != null)
+            {
+                accountSelector.SelectedAccount = knownAccount;
+                TrySetAccountSelectorDisplayText(knownAccount.Name);
+                return IsAccountSelectionByName(knownAccount.Name) || string.Equals(GetAccountSelectorDisplayText(), knownAccount.Name, StringComparison.OrdinalIgnoreCase);
+            }
+
+            TrySetAccountSelectorDisplayText(target);
+            return string.Equals(GetAccountSelectorDisplayText(), target, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool IsAccountSelectionByName(string accountName)
+        {
+            if (string.IsNullOrWhiteSpace(accountName))
+                return false;
+
+            return string.Equals(CurrentAccountSelectionName(), accountName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private string GetAccountNameFromItem(object item)
+        {
+            if (item == null)
+                return null;
+
+            Account account = item as Account;
+            if (account != null)
+                return account.Name;
+
+            string itemText = item.ToString();
+            return string.IsNullOrWhiteSpace(itemText) ? null : itemText.Trim();
+        }
+
+        private string GetAccountSelectorDisplayText()
+        {
+            if (accountSelector == null)
+                return null;
+
+            try
+            {
+                var textProperty = accountSelector.GetType().GetProperty("Text");
+                if (textProperty != null)
+                {
+                    object value = textProperty.GetValue(accountSelector, null);
+                    string text = value != null ? value.ToString() : null;
+                    if (!string.IsNullOrWhiteSpace(text))
+                        return text.Trim();
+                }
+            }
+            catch
+            {
+            }
+
+            return null;
+        }
+
+        private void TrySetAccountSelectorDisplayText(string accountName)
+        {
+            if (accountSelector == null || string.IsNullOrWhiteSpace(accountName))
+                return;
+
+            try
+            {
+                var textProperty = accountSelector.GetType().GetProperty("Text");
+                if (textProperty != null && textProperty.CanWrite)
+                    textProperty.SetValue(accountSelector, accountName, null);
+            }
+            catch
+            {
+            }
+        }
+
+        private void StartPendingAccountRestoreLoop()
+        {
+            bool hasPendingSelection = !string.IsNullOrWhiteSpace(pendingDefaultAccountName)
+                || (pendingDefaultAccountIndex.HasValue && pendingDefaultAccountIndex.Value >= 0);
+            if (!hasPendingSelection && !isStartupAccountRestorePhase)
+                return;
+
+            if (pendingAccountRestoreTimer == null)
+            {
+                pendingAccountRestoreTimer = new DispatcherTimer();
+                pendingAccountRestoreTimer.Interval = PendingAccountRestoreInterval;
+                pendingAccountRestoreTimer.Tick += OnPendingAccountRestoreTick;
+            }
+
+            pendingAccountRestoreAttempts = 0;
+            pendingAccountRestoreTimer.Start();
+            TryApplyPendingDefaultAccountSelection();
+        }
+
+        private void StopPendingAccountRestoreLoop()
+        {
+            if (pendingAccountRestoreTimer != null && pendingAccountRestoreTimer.IsEnabled)
+                pendingAccountRestoreTimer.Stop();
+        }
+
+        private void OnPendingAccountRestoreTick(object sender, EventArgs e)
+        {
+            pendingAccountRestoreAttempts++;
+
+            string targetAccountName = ResolveAccountName(pendingDefaultAccountName)
+                ?? ResolveAccountName(preferredAccountName);
+
+            if (!string.IsNullOrWhiteSpace(targetAccountName))
+            {
+                TryApplyPendingDefaultAccountSelection();
+
+                string currentName = ResolveAccountName(CurrentAccountSelectionName()) ?? CurrentAccountSelectionName();
+                if (string.Equals(currentName, targetAccountName, StringComparison.OrdinalIgnoreCase))
+                {
+                    pendingDefaultAccountName = null;
+                    pendingDefaultAccountIndex = null;
+                    preferredAccountName = currentName;
+                    preferredAccountIndex = CurrentAccountSelectionIndex();
+                    isStartupAccountRestorePhase = false;
+                    startupStableTicks = 0;
+                    StopPendingAccountRestoreLoop();
+                    SaveCurrentUiState();
+                    return;
+                }
+            }
+
+            if (pendingAccountRestoreAttempts >= PendingAccountRestoreMaxAttempts)
+            {
+                isStartupAccountRestorePhase = false;
+                startupStableTicks = 0;
+                StopPendingAccountRestoreLoop();
+            }
+        }
+
+        private bool IsLikelyUserAccountInteraction()
+        {
+            if ((DateTime.UtcNow - lastAccountSelectorInteractionUtc) <= TimeSpan.FromSeconds(2))
+                return true;
+
+            if (accountSelector == null)
+                return false;
+
+            return accountSelector.IsKeyboardFocusWithin || accountSelector.IsMouseOver;
         }
 
         private void RenderCalendar(TradeAccountBook book)
@@ -3041,6 +3465,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         public string AccountName { get; set; }
         public bool AllAccounts { get; set; }
         public string LastSelectedAccountName { get; set; }
+        public int? LastSelectedAccountIndex { get; set; }
         public string InstrumentFilter { get; set; }
         public string SourceFilter { get; set; }
         public string SideFilter { get; set; }
