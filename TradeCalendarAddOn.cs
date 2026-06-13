@@ -192,10 +192,13 @@ namespace NinjaTrader.NinjaScript.AddOns
         private Button exportCsvButton;
         private TextBlock monthTitle;
         private TextBlock monthTotalText;
+        private TextBlock accountCashValueText;
         private Grid calendarGrid;
         private TextBlock dayHeaderText;
         private TextBlock dayPnlText;
         private StackPanel instrumentSummaryPanel;
+        private ComboBox tradeListViewComboBox;
+        private TextBlock tradesHeaderText;
         private DataGrid dayGrid;
         private TextBlock activeFilterSummaryText;
 
@@ -203,21 +206,15 @@ namespace NinjaTrader.NinjaScript.AddOns
         private DateTime selectedDate;
         private bool isApplyingUiState;
         private bool isRefreshingFilterChoices;
-        private string pendingDefaultAccountName;
-        private string preferredAccountName;
-        private int? pendingDefaultAccountIndex;
-        private int? preferredAccountIndex;
-        private DispatcherTimer pendingAccountRestoreTimer;
-        private int pendingAccountRestoreAttempts;
-        private DateTime lastAccountSelectorInteractionUtc;
-        private bool isStartupAccountRestorePhase;
-        private int startupStableTicks;
-        private bool isRestoringAccountSelection;
-        private bool isApplyingCommittedUserAccountSelection;
+        private bool isApplyingAccountSelection;
+        private string lastSelectedAccountName;
+        private string pendingRestoreAccountName;
+        private DispatcherTimer accountRestoreTimer;
+        private int accountRestoreAttempts;
+        private bool isStartupAccountRestorePending;
 
-        private const int PendingAccountRestoreMaxAttempts = 80;
-        private static readonly TimeSpan PendingAccountRestoreInterval = TimeSpan.FromMilliseconds(250);
-        private const int StartupStableTickThreshold = 4;
+        private const int AccountRestoreMaxAttempts = 20;
+        private static readonly TimeSpan AccountRestoreInterval = TimeSpan.FromMilliseconds(250);
 
         private readonly Brush positiveBrush = new SolidColorBrush(Color.FromRgb(56, 142, 60));
         private readonly Brush negativeBrush = new SolidColorBrush(Color.FromRgb(198, 40, 40));
@@ -230,11 +227,12 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AllSourcesText = "All sources";
         private const string AllSidesText = "All sides";
         private const string AllResultsText = "All results";
+        private const string MatchedTradesViewText = "Matched Trades";
+        private const string ExecutionLegsViewText = "Execution Legs";
 
         public TradeCalendarControl_v3()
         {
-            currentMonth = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1);
-            selectedDate = DateTime.Today;
+            ResetCalendarToToday();
 
             isApplyingUiState = true;
             try
@@ -252,8 +250,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnLoaded(object sender, RoutedEventArgs e)
         {
-            isStartupAccountRestorePhase = true;
-            startupStableTicks = 0;
             service.DataChanged += OnServiceDataChanged;
             service.EnsureInitialized();
             service.RefreshCurrentSessionSnapshots();
@@ -270,16 +266,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
 
             RefreshAll();
-            StartPendingAccountRestoreLoop();
         }
 
         private void OnUnloaded(object sender, RoutedEventArgs e)
         {
-            isStartupAccountRestorePhase = false;
-            startupStableTicks = 0;
-            StopPendingAccountRestoreLoop();
+            StopAccountRestoreTimer();
             service.DataChanged -= OnServiceDataChanged;
-            SaveCurrentUiState();
+            if (!isStartupAccountRestorePending)
+                SaveCurrentUiState();
         }
 
         private void OnServiceDataChanged(object sender, EventArgs e)
@@ -287,8 +281,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             Dispatcher.InvokeAsync(() =>
             {
                 RefreshFilterChoices();
-                TryApplyPendingDefaultAccountSelection();
-                StartPendingAccountRestoreLoop();
+                if (isStartupAccountRestorePending && TryRestorePendingAccountSelection())
+                    return;
+
                 RefreshAll();
             });
         }
@@ -333,8 +328,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             nextButton.Click += (s, e) => { currentMonth = currentMonth.AddMonths(1); RefreshAll(); };
             todayButton.Click += (s, e) =>
             {
-                currentMonth = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1);
-                selectedDate = DateTime.Today;
+                ResetCalendarToToday();
                 RefreshAll();
             };
             refreshButton.Click += (s, e) =>
@@ -388,10 +382,6 @@ namespace NinjaTrader.NinjaScript.AddOns
                 VerticalAlignment = VerticalAlignment.Center
             };
             accountSelector.SelectionChanged += OnAccountSelectionChanged;
-            accountSelector.PreviewMouseDown += OnAccountSelectorInteracted;
-            accountSelector.PreviewKeyDown += OnAccountSelectorInteracted;
-            accountSelector.LostKeyboardFocus += (s, e) => CommitAccountSelection();
-            accountSelector.LostFocus += (s, e) => CommitAccountSelection();
 
             allAccountsCheckBox = new CheckBox
             {
@@ -399,8 +389,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 VerticalAlignment = VerticalAlignment.Center,
                 Margin = new Thickness(0, 0, 10, 0)
             };
-            allAccountsCheckBox.Checked += OnAnyFilterChanged;
-            allAccountsCheckBox.Unchecked += OnAnyFilterChanged;
+            allAccountsCheckBox.Checked += OnAllAccountsChanged;
+            allAccountsCheckBox.Unchecked += OnAllAccountsChanged;
 
             instrumentComboBox = MakeFilterComboBox(170, AllInstrumentsText);
             sourceComboBox = MakeFilterComboBox(120, AllSourcesText, new[] { AllSourcesText, "Live", "Imported" });
@@ -496,117 +486,96 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnAccountSelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (isApplyingCommittedUserAccountSelection)
+            if (isApplyingUiState || isRefreshingFilterChoices || isApplyingAccountSelection || !IsLoaded || !IsUiReady())
                 return;
 
-            bool likelyUserInitiated = IsLikelyUserAccountInteraction();
-            string selectedAccountName = GetAccountNameFromSelectionArgs(e)
-                ?? ResolveAccountName(CurrentAccountSelectionName())
-                ?? CurrentAccountSelectionName();
-            int? selectedAccountIndex = CurrentAccountSelectionIndex();
-
-            if (likelyUserInitiated && !string.IsNullOrWhiteSpace(selectedAccountName) && !isRestoringAccountSelection)
-            {
-                QueueCommittedUserAccountSelection(selectedAccountName);
+            string selectedAccountName = GetSelectedAccountNameFromEvent(e) ?? GetCurrentlySelectedAccountName();
+            if (string.IsNullOrWhiteSpace(selectedAccountName))
                 return;
-            }
 
-            if (!string.IsNullOrWhiteSpace(selectedAccountName))
+            if (isStartupAccountRestorePending)
             {
-                if (isRestoringAccountSelection && !likelyUserInitiated)
+                if (string.Equals(selectedAccountName, pendingRestoreAccountName, StringComparison.OrdinalIgnoreCase))
                 {
-                    RefreshFilterChoices();
-                    RefreshAll();
+                    TryRestorePendingAccountSelection();
                     return;
                 }
 
-                if (isStartupAccountRestorePhase && !likelyUserInitiated && !string.IsNullOrWhiteSpace(preferredAccountName)
-                    && !string.Equals(selectedAccountName, preferredAccountName, StringComparison.OrdinalIgnoreCase))
-                {
-                    pendingDefaultAccountName = preferredAccountName;
-                    StartPendingAccountRestoreLoop();
-                    TryApplyPendingDefaultAccountSelection();
-                    RefreshFilterChoices();
-                    RefreshAll();
+                if (accountSelector == null || (!accountSelector.IsKeyboardFocusWithin && !accountSelector.IsMouseOver))
                     return;
-                }
 
-                preferredAccountName = selectedAccountName;
-                preferredAccountIndex = selectedAccountIndex;
-                pendingDefaultAccountName = null;
-                pendingDefaultAccountIndex = null;
-                StopPendingAccountRestoreLoop();
+                StopAccountRestoreTimer();
+                pendingRestoreAccountName = null;
+                isStartupAccountRestorePending = false;
             }
 
-            RefreshFilterChoices();
-            OnAnyFilterChanged(sender, e);
-        }
-
-        private void OnAccountSelectorInteracted(object sender, InputEventArgs e)
-        {
-            lastAccountSelectorInteractionUtc = DateTime.UtcNow;
-        }
-        private string GetAccountNameFromSelectionArgs(SelectionChangedEventArgs e)
-        {
-            if (e == null || e.AddedItems == null || e.AddedItems.Count == 0)
-                return null;
-
-            foreach (object item in e.AddedItems)
-            {
-                string itemName = GetAccountNameFromItem(item);
-                if (!string.IsNullOrWhiteSpace(itemName))
-                    return ResolveAccountName(itemName) ?? itemName;
-            }
-
-            return null;
-        }
-
-        private void QueueCommittedUserAccountSelection(string accountName)
-        {
-            string requestedAccountName = ResolveAccountName(accountName) ?? accountName;
-            if (string.IsNullOrWhiteSpace(requestedAccountName))
-                return;
-
-            Dispatcher.InvokeAsync(() => ApplyCommittedUserAccountSelection(requestedAccountName), DispatcherPriority.Background);
-        }
-
-        private void ApplyCommittedUserAccountSelection(string accountName)
-        {
-            string requestedAccountName = ResolveAccountName(accountName) ?? accountName;
-            if (string.IsNullOrWhiteSpace(requestedAccountName) || accountSelector == null)
-                return;
-
-            isApplyingCommittedUserAccountSelection = true;
-            isRestoringAccountSelection = true;
-            try
-            {
-                TrySelectAccountByName(requestedAccountName);
-                TrySetAccountSelectorDisplayText(requestedAccountName);
-                preferredAccountName = requestedAccountName;
-                preferredAccountIndex = CurrentAccountSelectionIndex();
-                pendingDefaultAccountName = null;
-                pendingDefaultAccountIndex = null;
-                isStartupAccountRestorePhase = false;
-                startupStableTicks = 0;
-                StopPendingAccountRestoreLoop();
-            }
-            finally
-            {
-                isRestoringAccountSelection = false;
-                isApplyingCommittedUserAccountSelection = false;
-            }
-
+            lastSelectedAccountName = selectedAccountName;
             SaveCurrentUiState();
             RefreshFilterChoices();
             RefreshAll();
         }
 
-        private void CommitAccountSelection()
+        private string GetSelectedAccountNameFromEvent(SelectionChangedEventArgs e)
         {
-            if (isApplyingUiState || isRefreshingFilterChoices || isRestoringAccountSelection)
+            if (e == null || e.AddedItems == null)
+                return null;
+
+            foreach (object item in e.AddedItems)
+            {
+                Account accountItem = item as Account;
+                if (accountItem != null && !string.IsNullOrWhiteSpace(accountItem.Name))
+                    return accountItem.Name;
+
+                Account knownAccount = FindAccountByName(GetAccountNameFromItem(item));
+                if (knownAccount != null)
+                    return knownAccount.Name;
+            }
+
+            return null;
+        }
+
+        private void OnAllAccountsChanged(object sender, RoutedEventArgs e)
+        {
+            if (isApplyingUiState || isApplyingAccountSelection || !IsLoaded || !IsUiReady())
                 return;
 
+            if (isStartupAccountRestorePending)
+            {
+                StopAccountRestoreTimer();
+                pendingRestoreAccountName = null;
+                isStartupAccountRestorePending = false;
+            }
+
+            bool useAllAccounts = allAccountsCheckBox.IsChecked == true;
+            accountSelector.IsEnabled = !useAllAccounts;
+
+            if (!useAllAccounts)
+            {
+                string selectedAccountName = GetCurrentlySelectedAccountName();
+                if (!string.IsNullOrWhiteSpace(lastSelectedAccountName)
+                    && !string.Equals(selectedAccountName, lastSelectedAccountName, StringComparison.OrdinalIgnoreCase))
+                {
+                    TrySelectAccountByNameSimple(lastSelectedAccountName);
+                    selectedAccountName = GetCurrentlySelectedAccountName();
+                }
+
+                if (string.IsNullOrWhiteSpace(selectedAccountName))
+                {
+                    if (!TrySelectFirstAvailableAccount())
+                    {
+                        SelectFallbackAccountOrAllAccounts();
+                        useAllAccounts = true;
+                    }
+                    selectedAccountName = GetCurrentlySelectedAccountName();
+                }
+
+                if (!string.IsNullOrWhiteSpace(selectedAccountName))
+                    lastSelectedAccountName = selectedAccountName;
+            }
+
             SaveCurrentUiState();
+            RefreshFilterChoices();
+            RefreshAll();
         }
 
         private void OnAnyFilterChanged(object sender, RoutedEventArgs e)
@@ -616,13 +585,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (accountSelector != null && allAccountsCheckBox != null)
                 accountSelector.IsEnabled = allAccountsCheckBox.IsChecked != true;
-
-            bool protectStartupStateFromDrift = isStartupAccountRestorePhase && !IsLikelyUserAccountInteraction();
-            if (protectStartupStateFromDrift)
-            {
-                RefreshAll();
-                return;
-            }
 
             SaveCurrentUiState();
             RefreshAll();
@@ -731,7 +693,6 @@ namespace NinjaTrader.NinjaScript.AddOns
                     instrumentComboBox.SelectedIndex = 0;
 
                 accountSelector.IsEnabled = allAccountsCheckBox.IsChecked != true;
-                TryApplyPendingDefaultAccountSelection();
             }
             finally
             {
@@ -742,87 +703,81 @@ namespace NinjaTrader.NinjaScript.AddOns
         private void LoadSavedUiState()
         {
             TradeCalendarUiState state = TradeCalendarUiState.Load();
-            if (state == null)
-                return;
+            ResetCalendarToToday();
 
-            if (state.CurrentMonth != DateTime.MinValue)
-                currentMonth = new DateTime(state.CurrentMonth.Year, state.CurrentMonth.Month, 1);
-            if (state.SelectedDate != DateTime.MinValue)
-                selectedDate = state.SelectedDate.Date;
+            lastSelectedAccountName = GetSavedAccountName(state);
+            bool useAllAccounts = state != null && state.AllAccounts;
+            allAccountsCheckBox.IsChecked = useAllAccounts;
+            accountSelector.IsEnabled = !useAllAccounts;
+            pendingRestoreAccountName = null;
+            isStartupAccountRestorePending = false;
+            StopAccountRestoreTimer();
 
-            allAccountsCheckBox.IsChecked = state.AllAccounts;
-            accountSelector.IsEnabled = !state.AllAccounts;
+            if (!useAllAccounts)
+            {
+                if (!string.IsNullOrWhiteSpace(lastSelectedAccountName))
+                {
+                    pendingRestoreAccountName = lastSelectedAccountName;
+                    isStartupAccountRestorePending = true;
+                    if (!TryRestorePendingAccountSelection())
+                        StartAccountRestoreTimer();
+                }
+                else if (!TrySelectFirstAvailableAccount())
+                {
+                    SelectFallbackAccountOrAllAccounts();
+                }
+            }
 
-            pendingDefaultAccountName = !string.IsNullOrWhiteSpace(state.LastSelectedAccountName)
-                ? state.LastSelectedAccountName
-                : state.AccountName;
+            ApplyComboSelection(sourceComboBox, state == null || string.IsNullOrWhiteSpace(state.SourceFilter) ? AllSourcesText : state.SourceFilter);
+            ApplyComboSelection(sideComboBox, state == null || string.IsNullOrWhiteSpace(state.SideFilter) ? AllSidesText : state.SideFilter);
+            ApplyComboSelection(resultComboBox, state == null || string.IsNullOrWhiteSpace(state.ResultFilter) ? AllResultsText : state.ResultFilter);
 
-            // Account list ordering is not stable across NinjaTrader sessions,
-            // so a persisted index can point at the wrong Apex account next time.
-            // Restore by account name first and only use the saved index when no name exists.
-            pendingDefaultAccountIndex = string.IsNullOrWhiteSpace(pendingDefaultAccountName)
-                ? state.LastSelectedAccountIndex
-                : null;
-
-            preferredAccountName = pendingDefaultAccountName;
-            preferredAccountIndex = pendingDefaultAccountIndex;
-            TryApplyPendingDefaultAccountSelection();
-            StartPendingAccountRestoreLoop();
-            NinjaTrader.Code.Output.Process("TradeCalendar loaded account='" + (pendingDefaultAccountName ?? preferredAccountName ?? string.Empty) + "'", PrintTo.OutputTab1);
-
-            ApplyComboSelection(sourceComboBox, string.IsNullOrWhiteSpace(state.SourceFilter) ? AllSourcesText : state.SourceFilter);
-            ApplyComboSelection(sideComboBox, string.IsNullOrWhiteSpace(state.SideFilter) ? AllSidesText : state.SideFilter);
-            ApplyComboSelection(resultComboBox, string.IsNullOrWhiteSpace(state.ResultFilter) ? AllResultsText : state.ResultFilter);
-
-            fromDatePicker.SelectedDate = state.FromDate;
-            toDatePicker.SelectedDate = state.ToDate;
+            fromDatePicker.SelectedDate = state != null ? state.FromDate : null;
+            toDatePicker.SelectedDate = state != null ? state.ToDate : null;
 
             RefreshFilterChoices();
 
-            string wantedInstrument = string.IsNullOrWhiteSpace(state.InstrumentFilter) ? AllInstrumentsText : state.InstrumentFilter;
+            string wantedInstrument = state == null || string.IsNullOrWhiteSpace(state.InstrumentFilter) ? AllInstrumentsText : state.InstrumentFilter;
             if (instrumentComboBox.Items.Cast<object>().Any(i => string.Equals(i.ToString(), wantedInstrument, StringComparison.OrdinalIgnoreCase)))
                 instrumentComboBox.SelectedItem = wantedInstrument;
             else if (instrumentComboBox.Items.Count > 0)
                 instrumentComboBox.SelectedIndex = 0;
+
+            string wantedTradeListView = state == null || string.IsNullOrWhiteSpace(state.TradeListViewMode)
+                ? MatchedTradesViewText
+                : state.TradeListViewMode;
+            ApplyComboSelection(tradeListViewComboBox, wantedTradeListView);
+            ConfigureDayGridColumns();
+        }
+
+        private void ResetCalendarToToday()
+        {
+            DateTime today = DateTime.Today;
+            currentMonth = new DateTime(today.Year, today.Month, 1);
+            selectedDate = today;
         }
 
         private void SaveCurrentUiState()
         {
+            if (isStartupAccountRestorePending)
+                return;
+
             try
             {
-                string selectedAccountName = GetPersistableAccountSelectionName() ?? string.Empty;
-                int? selectedAccountIndex = null;
-                bool protectStartupStateFromDrift = isStartupAccountRestorePhase && !IsLikelyUserAccountInteraction();
-
-                if (!protectStartupStateFromDrift && !string.IsNullOrWhiteSpace(selectedAccountName))
-                {
-                    preferredAccountName = selectedAccountName;
-                    preferredAccountIndex = selectedAccountIndex;
-                }
-                else if (string.IsNullOrWhiteSpace(preferredAccountName) && !string.IsNullOrWhiteSpace(selectedAccountName))
-                {
-                    preferredAccountName = selectedAccountName;
-                    preferredAccountIndex = selectedAccountIndex;
-                }
-
-                string persistedDefaultAccountName = !string.IsNullOrWhiteSpace(pendingDefaultAccountName)
-                    ? pendingDefaultAccountName
-                    : (!string.IsNullOrWhiteSpace(preferredAccountName) ? preferredAccountName : selectedAccountName);
-
-                // Persist the name as the authoritative restore key.
-                // The index is only useful as a last-resort fallback when no name is available.
-                int? persistedDefaultAccountIndex = string.IsNullOrWhiteSpace(persistedDefaultAccountName)
-                    ? (pendingDefaultAccountIndex.HasValue
-                        ? pendingDefaultAccountIndex
-                        : (preferredAccountIndex.HasValue ? preferredAccountIndex : selectedAccountIndex))
-                    : null;
+                bool useAllAccounts = allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true;
+                string selectedAccountName = GetCurrentlySelectedAccountName();
+                if (!useAllAccounts && !string.IsNullOrWhiteSpace(selectedAccountName))
+                    lastSelectedAccountName = selectedAccountName;
+                string persistedAccountName = useAllAccounts
+                    ? lastSelectedAccountName ?? string.Empty
+                    : selectedAccountName ?? lastSelectedAccountName ?? string.Empty;
 
                 TradeCalendarUiState state = new TradeCalendarUiState
                 {
-                    AccountName = allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true ? string.Empty : persistedDefaultAccountName,
-                    AllAccounts = allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true,
-                    LastSelectedAccountName = persistedDefaultAccountName,
-                    LastSelectedAccountIndex = persistedDefaultAccountIndex,
+                    AccountName = useAllAccounts ? string.Empty : persistedAccountName,
+                    AllAccounts = useAllAccounts,
+                    LastSelectedAccountName = lastSelectedAccountName ?? string.Empty,
+                    LastSelectedAccountIndex = null,
                     InstrumentFilter = GetComboSelection(instrumentComboBox, AllInstrumentsText),
                     SourceFilter = GetComboSelection(sourceComboBox, AllSourcesText),
                     SideFilter = GetComboSelection(sideComboBox, AllSidesText),
@@ -830,10 +785,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                     FromDate = fromDatePicker != null ? fromDatePicker.SelectedDate : null,
                     ToDate = toDatePicker != null ? toDatePicker.SelectedDate : null,
                     CurrentMonth = currentMonth,
-                    SelectedDate = selectedDate
+                    SelectedDate = selectedDate,
+                    TradeListViewMode = GetTradeListViewMode()
                 };
                 state.Save();
-                NinjaTrader.Code.Output.Process("TradeCalendar saved account='" + (persistedDefaultAccountName ?? string.Empty) + "' display='" + (GetAccountSelectorDisplayText() ?? string.Empty) + "'", PrintTo.OutputTab1);
+                NinjaTrader.Code.Output.Process(
+                    "TradeCalendar saved account='" + persistedAccountName + "', allAccounts=" + useAllAccounts,
+                    PrintTo.OutputTab1);
             }
             catch
             {
@@ -856,36 +814,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (combo.Items.Count > 0)
                 combo.SelectedIndex = 0;
-        }
-
-        private void TryApplyPendingDefaultAccountSelection()
-        {
-            if (accountSelector == null)
-                return;
-
-            string targetAccountName = ResolveAccountName(pendingDefaultAccountName)
-                ?? ResolveAccountName(preferredAccountName)
-                ?? ResolveAccountName(GetAccountSelectorDisplayText());
-
-            if (string.IsNullOrWhiteSpace(targetAccountName))
-                return;
-
-            isRestoringAccountSelection = true;
-            try
-            {
-                if (!TrySelectAccountByName(targetAccountName))
-                    return;
-
-                TrySetAccountSelectorDisplayText(targetAccountName);
-                preferredAccountName = targetAccountName;
-                preferredAccountIndex = CurrentAccountSelectionIndex();
-                pendingDefaultAccountName = null;
-                pendingDefaultAccountIndex = null;
-            }
-            finally
-            {
-                isRestoringAccountSelection = false;
-            }
         }
 
         private string GetComboSelection(ComboBox combo, string defaultLabel)
@@ -973,9 +901,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Padding = new Thickness(12, 8, 12, 8)
             };
 
-            DockPanel panel = new DockPanel();
+            Grid panel = new Grid();
+            panel.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            panel.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-            TextBlock label = new TextBlock
+            StackPanel leftPanel = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+
+            TextBlock monthLabel = new TextBlock
             {
                 Text = "Month total",
                 FontSize = 16,
@@ -990,11 +926,40 @@ namespace NinjaTrader.NinjaScript.AddOns
                 VerticalAlignment = VerticalAlignment.Center
             };
 
-            DockPanel.SetDock(label, Dock.Left);
-            DockPanel.SetDock(monthTotalText, Dock.Left);
+            leftPanel.Children.Add(monthLabel);
+            leftPanel.Children.Add(monthTotalText);
 
-            panel.Children.Add(label);
-            panel.Children.Add(monthTotalText);
+            StackPanel rightPanel = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Right
+            };
+
+            TextBlock cashLabel = new TextBlock
+            {
+                Text = "Account cash value",
+                FontSize = 14,
+                Margin = new Thickness(18, 0, 10, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = neutralBrush
+            };
+
+            accountCashValueText = new TextBlock
+            {
+                FontSize = 20,
+                FontWeight = FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = neutralBrush
+            };
+
+            rightPanel.Children.Add(cashLabel);
+            rightPanel.Children.Add(accountCashValueText);
+
+            panel.Children.Add(leftPanel);
+            Grid.SetColumn(leftPanel, 0);
+            panel.Children.Add(rightPanel);
+            Grid.SetColumn(rightPanel, 1);
             border.Child = panel;
 
             Children.Add(border);
@@ -1120,13 +1085,47 @@ namespace NinjaTrader.NinjaScript.AddOns
             rightPanel.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             rightPanel.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
-            TextBlock tradesHeader = new TextBlock
+            Grid tradeListHeader = new Grid
             {
-                Text = "Trades / execution breakdown",
+                Margin = new Thickness(12, 8, 12, 8)
+            };
+            tradeListHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            tradeListHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            tradeListHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            tradesHeaderText = new TextBlock
+            {
+                Text = "Matched trades",
                 FontSize = 16,
                 FontWeight = FontWeights.SemiBold,
-                Margin = new Thickness(12, 10, 12, 8)
+                VerticalAlignment = VerticalAlignment.Center
             };
+
+            TextBlock tradeListViewLabel = new TextBlock
+            {
+                Text = "Trade List View",
+                Margin = new Thickness(12, 0, 8, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = neutralBrush
+            };
+
+            tradeListViewComboBox = new ComboBox
+            {
+                Width = 145,
+                MinHeight = 26,
+                VerticalContentAlignment = VerticalAlignment.Center
+            };
+            tradeListViewComboBox.Items.Add(MatchedTradesViewText);
+            tradeListViewComboBox.Items.Add(ExecutionLegsViewText);
+            tradeListViewComboBox.SelectedItem = MatchedTradesViewText;
+            tradeListViewComboBox.SelectionChanged += OnTradeListViewChanged;
+
+            tradeListHeader.Children.Add(tradesHeaderText);
+            Grid.SetColumn(tradesHeaderText, 0);
+            tradeListHeader.Children.Add(tradeListViewLabel);
+            Grid.SetColumn(tradeListViewLabel, 1);
+            tradeListHeader.Children.Add(tradeListViewComboBox);
+            Grid.SetColumn(tradeListViewComboBox, 2);
 
             dayGrid = new DataGrid
             {
@@ -1142,6 +1141,165 @@ namespace NinjaTrader.NinjaScript.AddOns
             };
             dayGrid.LoadingRow += OnDayGridLoadingRow;
 
+            ConfigureDayGridColumns();
+
+            rightPanel.Children.Add(tradeListHeader);
+            Grid.SetRow(tradeListHeader, 0);
+
+            rightPanel.Children.Add(dayGrid);
+            Grid.SetRow(dayGrid, 1);
+
+            rightCard.Child = rightPanel;
+
+            detail.Children.Add(leftCard);
+            Grid.SetColumn(leftCard, 0);
+
+            detail.Children.Add(rightCard);
+            Grid.SetColumn(rightCard, 1);
+
+            Children.Add(detail);
+            Grid.SetRow(detail, 5);
+        }
+
+        private void OnDayGridLoadingRow(object sender, DataGridRowEventArgs e)
+        {
+            double? pnl = null;
+            MatchedTradeRow matchedTrade = e.Row.Item as MatchedTradeRow;
+            if (matchedTrade != null)
+                pnl = matchedTrade.Pnl;
+
+            ExecutionBreakdownRow executionLeg = e.Row.Item as ExecutionBreakdownRow;
+            if (executionLeg != null)
+                pnl = executionLeg.Pnl;
+
+            if (!pnl.HasValue)
+            {
+                e.Row.Background = Brushes.White;
+                e.Row.Foreground = Brushes.Black;
+                return;
+            }
+
+            if (pnl.Value > 0)
+            {
+                e.Row.Background = softPositiveBrush;
+                e.Row.Foreground = Brushes.Black;
+            }
+            else if (pnl.Value < 0)
+            {
+                e.Row.Background = softNegativeBrush;
+                e.Row.Foreground = Brushes.Black;
+            }
+            else
+            {
+                e.Row.Background = Brushes.WhiteSmoke;
+                e.Row.Foreground = Brushes.Black;
+            }
+        }
+
+        private void OnTradeListViewChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (isApplyingUiState || !IsLoaded || !IsUiReady())
+                return;
+
+            ConfigureDayGridColumns();
+            SaveCurrentUiState();
+            RefreshAll();
+        }
+
+        private string GetTradeListViewMode()
+        {
+            string selected = GetComboSelection(tradeListViewComboBox, MatchedTradesViewText);
+            return string.Equals(selected, ExecutionLegsViewText, StringComparison.OrdinalIgnoreCase)
+                ? ExecutionLegsViewText
+                : MatchedTradesViewText;
+        }
+
+        private void ConfigureDayGridColumns()
+        {
+            if (dayGrid == null)
+                return;
+
+            dayGrid.Columns.Clear();
+
+            if (string.Equals(GetTradeListViewMode(), ExecutionLegsViewText, StringComparison.OrdinalIgnoreCase))
+            {
+                if (tradesHeaderText != null)
+                    tradesHeaderText.Text = "Trades / execution breakdown";
+                AddExecutionLegColumns();
+                return;
+            }
+
+            if (tradesHeaderText != null)
+                tradesHeaderText.Text = "Matched trades";
+            AddMatchedTradeColumns();
+        }
+
+        private void AddMatchedTradeColumns()
+        {
+            dayGrid.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Entry Time",
+                Binding = new Binding("EntryTimeDisplay"),
+                Width = new DataGridLength(150)
+            });
+            dayGrid.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Exit Time",
+                Binding = new Binding("ExitTimeDisplay"),
+                Width = new DataGridLength(150)
+            });
+            dayGrid.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Symbol",
+                Binding = new Binding("Symbol"),
+                Width = new DataGridLength(85)
+            });
+            dayGrid.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Side",
+                Binding = new Binding("Direction"),
+                Width = new DataGridLength(70)
+            });
+            dayGrid.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Qty",
+                Binding = new Binding("Qty"),
+                Width = new DataGridLength(55)
+            });
+            dayGrid.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Entry Price",
+                Binding = new Binding("EntryPriceDisplay"),
+                Width = new DataGridLength(95)
+            });
+            dayGrid.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Exit Price",
+                Binding = new Binding("ExitPriceDisplay"),
+                Width = new DataGridLength(95)
+            });
+            dayGrid.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Commission",
+                Binding = new Binding("CommissionDisplay"),
+                Width = new DataGridLength(95)
+            });
+            dayGrid.Columns.Add(new DataGridTextColumn
+            {
+                Header = "P&L",
+                Binding = new Binding("PnlDisplay"),
+                Width = new DataGridLength(90)
+            });
+            dayGrid.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Source",
+                Binding = new Binding("Source"),
+                Width = new DataGridLength(85)
+            });
+        }
+
+        private void AddExecutionLegColumns()
+        {
             dayGrid.Columns.Add(new DataGridTextColumn
             {
                 Header = "Time",
@@ -1208,50 +1366,6 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Binding = new Binding("Source"),
                 Width = new DataGridLength(95)
             });
-
-            rightPanel.Children.Add(tradesHeader);
-            Grid.SetRow(tradesHeader, 0);
-
-            rightPanel.Children.Add(dayGrid);
-            Grid.SetRow(dayGrid, 1);
-
-            rightCard.Child = rightPanel;
-
-            detail.Children.Add(leftCard);
-            Grid.SetColumn(leftCard, 0);
-
-            detail.Children.Add(rightCard);
-            Grid.SetColumn(rightCard, 1);
-
-            Children.Add(detail);
-            Grid.SetRow(detail, 5);
-        }
-
-        private void OnDayGridLoadingRow(object sender, DataGridRowEventArgs e)
-        {
-            ExecutionBreakdownRow row = e.Row.Item as ExecutionBreakdownRow;
-            if (row == null || !row.Pnl.HasValue)
-            {
-                e.Row.Background = Brushes.White;
-                e.Row.Foreground = Brushes.Black;
-                return;
-            }
-
-            if (row.Pnl.Value > 0)
-            {
-                e.Row.Background = softPositiveBrush;
-                e.Row.Foreground = Brushes.Black;
-            }
-            else if (row.Pnl.Value < 0)
-            {
-                e.Row.Background = softNegativeBrush;
-                e.Row.Foreground = Brushes.Black;
-            }
-            else
-            {
-                e.Row.Background = Brushes.WhiteSmoke;
-                e.Row.Foreground = Brushes.Black;
-            }
         }
 
         private Button MakeButton(string text)
@@ -1270,10 +1384,13 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             return monthTitle != null
                 && monthTotalText != null
+                && accountCashValueText != null
                 && calendarGrid != null
                 && dayHeaderText != null
                 && dayPnlText != null
                 && instrumentSummaryPanel != null
+                && tradeListViewComboBox != null
+                && tradesHeaderText != null
                 && dayGrid != null
                 && activeFilterSummaryText != null
                 && instrumentComboBox != null
@@ -1297,11 +1414,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             monthTitle.Text = currentMonth.ToString("MMMM yyyy", CultureInfo.InvariantCulture);
             monthTotalText.Text = FormatCurrency(book.GetMonthTotal(currentMonth));
             monthTotalText.Foreground = ChooseBrush(book.GetMonthTotal(currentMonth));
+            accountCashValueText.Text = GetAccountCashValueDisplay();
+            accountCashValueText.Foreground = neutralBrush;
 
             activeFilterSummaryText.Text = BuildFilterSummary(filters);
 
             RenderCalendar(book);
-            RefreshDetail(book);
+            RefreshDetail(book, filters);
             SaveCurrentUiState();
         }
 
@@ -1350,106 +1469,148 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true)
                 return null;
 
-            if (!string.IsNullOrWhiteSpace(preferredAccountName))
-                return preferredAccountName;
-
-            if (!string.IsNullOrWhiteSpace(pendingDefaultAccountName))
-                return pendingDefaultAccountName;
-
-            string selectedAccountName = CurrentAccountSelectionName();
+            string selectedAccountName = GetCurrentlySelectedAccountName();
             if (!string.IsNullOrWhiteSpace(selectedAccountName))
                 return selectedAccountName;
 
+            Account rememberedAccount = FindAccountByName(lastSelectedAccountName);
+            if (rememberedAccount != null)
+                return rememberedAccount.Name;
+
             return null;
         }
 
-        private string GetPersistableAccountSelectionName()
+        private string GetAccountCashValueDisplay()
         {
-            string displayText = GetAccountSelectorDisplayText();
-            if (!string.IsNullOrWhiteSpace(displayText))
+            if (allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true)
+                return "All accounts";
+
+            string accountName = GetSelectedAccountName();
+            if (string.IsNullOrWhiteSpace(accountName))
+                return "N/A";
+
+            Account account = FindAccountByName(accountName);
+            if (account == null)
+                return "N/A";
+
+            try
             {
-                string matched = ResolveAccountName(displayText);
-                if (!string.IsNullOrWhiteSpace(matched))
-                    return matched;
+                double cashValue = account.Get(AccountItem.CashValue, Currency.UsDollar);
+                if (double.IsNaN(cashValue) || double.IsInfinity(cashValue))
+                    return "N/A";
+
+                return FormatCurrencyWithCents(cashValue);
+            }
+            catch
+            {
+                return "N/A";
+            }
+        }
+
+        private string GetSavedAccountName(TradeCalendarUiState state)
+        {
+            if (state == null)
+                return null;
+
+            string savedName = !string.IsNullOrWhiteSpace(state.LastSelectedAccountName)
+                ? state.LastSelectedAccountName
+                : state.AccountName;
+
+            return string.IsNullOrWhiteSpace(savedName) ? null : savedName.Trim();
+        }
+
+        private bool TryRestorePendingAccountSelection()
+        {
+            if (string.IsNullOrWhiteSpace(pendingRestoreAccountName))
+                return true;
+
+            string requestedAccountName = pendingRestoreAccountName;
+            if (!TrySelectAccountByNameSimple(requestedAccountName))
+                return false;
+
+            lastSelectedAccountName = GetCurrentlySelectedAccountName() ?? requestedAccountName;
+            pendingRestoreAccountName = null;
+            isStartupAccountRestorePending = false;
+            StopAccountRestoreTimer();
+            SaveCurrentUiState();
+            RefreshFilterChoices();
+            RefreshAll();
+            NinjaTrader.Code.Output.Process("TradeCalendar restored account='" + lastSelectedAccountName + "'", PrintTo.OutputTab1);
+            return true;
+        }
+
+        private void StartAccountRestoreTimer()
+        {
+            if (!isStartupAccountRestorePending || string.IsNullOrWhiteSpace(pendingRestoreAccountName))
+                return;
+
+            if (accountRestoreTimer == null)
+            {
+                accountRestoreTimer = new DispatcherTimer();
+                accountRestoreTimer.Interval = AccountRestoreInterval;
+                accountRestoreTimer.Tick += OnAccountRestoreTimerTick;
             }
 
-            string selectedName = CurrentAccountSelectionName();
-            if (!string.IsNullOrWhiteSpace(selectedName))
-                return ResolveAccountName(selectedName) ?? selectedName;
-
-            if (!string.IsNullOrWhiteSpace(preferredAccountName))
-                return ResolveAccountName(preferredAccountName) ?? preferredAccountName;
-
-            return null;
+            accountRestoreAttempts = 0;
+            accountRestoreTimer.Start();
         }
 
-        private string CurrentAccountSelectionName()
+        private void StopAccountRestoreTimer()
+        {
+            if (accountRestoreTimer != null && accountRestoreTimer.IsEnabled)
+                accountRestoreTimer.Stop();
+        }
+
+        private void OnAccountRestoreTimerTick(object sender, EventArgs e)
+        {
+            accountRestoreAttempts++;
+            if (TryRestorePendingAccountSelection())
+                return;
+
+            if (accountRestoreAttempts < AccountRestoreMaxAttempts)
+                return;
+
+            StopAccountRestoreTimer();
+            isStartupAccountRestorePending = false;
+            pendingRestoreAccountName = null;
+            SelectFallbackAccountOrAllAccounts();
+            SaveCurrentUiState();
+            RefreshFilterChoices();
+            RefreshAll();
+            NinjaTrader.Code.Output.Process(
+                "TradeCalendar account restore failed after retries; fallback to All accounts.",
+                PrintTo.OutputTab1);
+        }
+
+        private string GetCurrentlySelectedAccountName()
         {
             if (accountSelector == null)
                 return null;
+
+            Account selectedItemAccount = accountSelector.SelectedItem as Account;
+            if (selectedItemAccount != null && !string.IsNullOrWhiteSpace(selectedItemAccount.Name))
+                return selectedItemAccount.Name;
+
+            string selectedItemName = GetAccountNameFromItem(accountSelector.SelectedItem);
+            Account knownAccount = FindAccountByName(selectedItemName);
+            if (knownAccount != null)
+                return knownAccount.Name;
 
             if (accountSelector.SelectedAccount != null && !string.IsNullOrWhiteSpace(accountSelector.SelectedAccount.Name))
                 return accountSelector.SelectedAccount.Name;
 
-            string selectedItemName = GetAccountNameFromItem(accountSelector.SelectedItem);
-            if (!string.IsNullOrWhiteSpace(selectedItemName))
-                return selectedItemName;
-
-            string displayText = GetAccountSelectorDisplayText();
-            if (!string.IsNullOrWhiteSpace(displayText))
-                return displayText;
-
             return null;
         }
 
-        private int? CurrentAccountSelectionIndex()
-        {
-            if (accountSelector == null)
-                return null;
-
-            return accountSelector.SelectedIndex >= 0 ? (int?)accountSelector.SelectedIndex : null;
-        }
-
-        private string ResolveAccountName(string accountName)
-        {
-            if (string.IsNullOrWhiteSpace(accountName))
-                return null;
-
-            string trimmed = accountName.Trim();
-
-            if (accountSelector != null)
-            {
-                foreach (object item in accountSelector.Items)
-                {
-                    string itemName = GetAccountNameFromItem(item);
-                    if (string.Equals(itemName, trimmed, StringComparison.OrdinalIgnoreCase))
-                        return itemName;
-                }
-            }
-
-            Account knownAccount = FindAccountByName(trimmed);
-            if (knownAccount != null && !string.IsNullOrWhiteSpace(knownAccount.Name))
-                return knownAccount.Name;
-
-            return null;
-        }
-
-        private bool TrySelectAccountByIndex(int index)
-        {
-            if (accountSelector == null || index < 0 || index >= accountSelector.Items.Count)
-                return false;
-
-            accountSelector.SelectedIndex = index;
-            int? current = CurrentAccountSelectionIndex();
-            return current.HasValue && current.Value == index;
-        }
-
-        private bool TrySelectAccountByName(string accountName)
+        private bool TrySelectAccountByNameSimple(string accountName)
         {
             if (string.IsNullOrWhiteSpace(accountName) || accountSelector == null)
                 return false;
 
-            string target = ResolveAccountName(accountName) ?? accountName.Trim();
+            string target = accountName.Trim();
+            object matchingItem = null;
+            Account matchingAccount = null;
+            int matchingIndex = -1;
 
             for (int i = 0; i < accountSelector.Items.Count; i++)
             {
@@ -1458,33 +1619,43 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (!string.Equals(itemName, target, StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                accountSelector.SelectedIndex = i;
-                accountSelector.SelectedItem = item;
-                Account accountItem = item as Account;
-                if (accountItem != null)
-                    accountSelector.SelectedAccount = accountItem;
-                TrySetAccountSelectorDisplayText(target);
-                return IsAccountSelectionByName(target) || string.Equals(GetAccountSelectorDisplayText(), target, StringComparison.OrdinalIgnoreCase);
+                matchingItem = item;
+                matchingAccount = item as Account;
+                matchingIndex = i;
+                break;
             }
 
-            Account knownAccount = FindAccountByName(target);
-            if (knownAccount != null)
-            {
-                accountSelector.SelectedAccount = knownAccount;
-                TrySetAccountSelectorDisplayText(knownAccount.Name);
-                return IsAccountSelectionByName(knownAccount.Name) || string.Equals(GetAccountSelectorDisplayText(), knownAccount.Name, StringComparison.OrdinalIgnoreCase);
-            }
+            if (matchingAccount == null)
+                matchingAccount = FindAccountByName(target);
 
-            TrySetAccountSelectorDisplayText(target);
-            return string.Equals(GetAccountSelectorDisplayText(), target, StringComparison.OrdinalIgnoreCase);
-        }
-
-        private bool IsAccountSelectionByName(string accountName)
-        {
-            if (string.IsNullOrWhiteSpace(accountName))
+            if (matchingItem == null && matchingAccount == null)
                 return false;
 
-            return string.Equals(CurrentAccountSelectionName(), accountName, StringComparison.OrdinalIgnoreCase);
+            bool previousApplyingAccountSelection = isApplyingAccountSelection;
+            isApplyingAccountSelection = true;
+            try
+            {
+                if (matchingItem != null)
+                {
+                    accountSelector.SelectedIndex = matchingIndex;
+                    accountSelector.SelectedItem = matchingItem;
+                }
+                if (matchingAccount != null)
+                    accountSelector.SelectedAccount = matchingAccount;
+            }
+            finally
+            {
+                isApplyingAccountSelection = previousApplyingAccountSelection;
+            }
+
+            if (matchingItem == null)
+                return false;
+
+            string selectedName = GetCurrentlySelectedAccountName();
+            string expectedName = matchingAccount != null ? matchingAccount.Name : GetAccountNameFromItem(matchingItem);
+            return accountSelector.SelectedIndex == matchingIndex
+                && !string.IsNullOrWhiteSpace(selectedName)
+                && string.Equals(selectedName, expectedName, StringComparison.OrdinalIgnoreCase);
         }
 
         private string GetAccountNameFromItem(object item)
@@ -1500,113 +1671,61 @@ namespace NinjaTrader.NinjaScript.AddOns
             return string.IsNullOrWhiteSpace(itemText) ? null : itemText.Trim();
         }
 
-        private string GetAccountSelectorDisplayText()
+        private bool TrySelectFirstAvailableAccount()
         {
-            if (accountSelector == null)
-                return null;
-
-            try
-            {
-                var textProperty = accountSelector.GetType().GetProperty("Text");
-                if (textProperty != null)
-                {
-                    object value = textProperty.GetValue(accountSelector, null);
-                    string text = value != null ? value.ToString() : null;
-                    if (!string.IsNullOrWhiteSpace(text))
-                        return text.Trim();
-                }
-            }
-            catch
-            {
-            }
-
-            return null;
-        }
-
-        private void TrySetAccountSelectorDisplayText(string accountName)
-        {
-            if (accountSelector == null || string.IsNullOrWhiteSpace(accountName))
-                return;
-
-            try
-            {
-                var textProperty = accountSelector.GetType().GetProperty("Text");
-                if (textProperty != null && textProperty.CanWrite)
-                    textProperty.SetValue(accountSelector, accountName, null);
-            }
-            catch
-            {
-            }
-        }
-
-        private void StartPendingAccountRestoreLoop()
-        {
-            bool hasPendingSelection = !string.IsNullOrWhiteSpace(pendingDefaultAccountName)
-                || (pendingDefaultAccountIndex.HasValue && pendingDefaultAccountIndex.Value >= 0);
-            if (!hasPendingSelection && !isStartupAccountRestorePhase)
-                return;
-
-            if (pendingAccountRestoreTimer == null)
-            {
-                pendingAccountRestoreTimer = new DispatcherTimer();
-                pendingAccountRestoreTimer.Interval = PendingAccountRestoreInterval;
-                pendingAccountRestoreTimer.Tick += OnPendingAccountRestoreTick;
-            }
-
-            pendingAccountRestoreAttempts = 0;
-            pendingAccountRestoreTimer.Start();
-            TryApplyPendingDefaultAccountSelection();
-        }
-
-        private void StopPendingAccountRestoreLoop()
-        {
-            if (pendingAccountRestoreTimer != null && pendingAccountRestoreTimer.IsEnabled)
-                pendingAccountRestoreTimer.Stop();
-        }
-
-        private void OnPendingAccountRestoreTick(object sender, EventArgs e)
-        {
-            pendingAccountRestoreAttempts++;
-
-            string targetAccountName = ResolveAccountName(pendingDefaultAccountName)
-                ?? ResolveAccountName(preferredAccountName);
-
-            if (!string.IsNullOrWhiteSpace(targetAccountName))
-            {
-                TryApplyPendingDefaultAccountSelection();
-
-                string currentName = ResolveAccountName(CurrentAccountSelectionName()) ?? CurrentAccountSelectionName();
-                if (string.Equals(currentName, targetAccountName, StringComparison.OrdinalIgnoreCase))
-                {
-                    pendingDefaultAccountName = null;
-                    pendingDefaultAccountIndex = null;
-                    preferredAccountName = currentName;
-                    preferredAccountIndex = CurrentAccountSelectionIndex();
-                    isStartupAccountRestorePhase = false;
-                    startupStableTicks = 0;
-                    StopPendingAccountRestoreLoop();
-                    SaveCurrentUiState();
-                    return;
-                }
-            }
-
-            if (pendingAccountRestoreAttempts >= PendingAccountRestoreMaxAttempts)
-            {
-                isStartupAccountRestorePhase = false;
-                startupStableTicks = 0;
-                StopPendingAccountRestoreLoop();
-            }
-        }
-
-        private bool IsLikelyUserAccountInteraction()
-        {
-            if ((DateTime.UtcNow - lastAccountSelectorInteractionUtc) <= TimeSpan.FromSeconds(2))
-                return true;
-
             if (accountSelector == null)
                 return false;
 
-            return accountSelector.IsKeyboardFocusWithin || accountSelector.IsMouseOver;
+            foreach (object item in accountSelector.Items)
+            {
+                string itemName = GetAccountNameFromItem(item);
+                if (TrySelectAccountByNameSimple(itemName))
+                {
+                    lastSelectedAccountName = GetCurrentlySelectedAccountName();
+                    return true;
+                }
+            }
+
+            List<string> accountNames;
+            lock (Account.All)
+            {
+                accountNames = Account.All
+                    .Where(account => account != null && !string.IsNullOrWhiteSpace(account.Name))
+                    .Select(account => account.Name)
+                    .ToList();
+            }
+
+            foreach (string accountName in accountNames)
+            {
+                if (TrySelectAccountByNameSimple(accountName))
+                {
+                    lastSelectedAccountName = GetCurrentlySelectedAccountName();
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void SelectFallbackAccountOrAllAccounts()
+        {
+            NinjaTrader.Code.Output.Process(
+                "TradeCalendar fallback to All accounts; account not available='" + (lastSelectedAccountName ?? string.Empty) + "'",
+                PrintTo.OutputTab1);
+
+            bool previousApplyingAccountSelection = isApplyingAccountSelection;
+            isApplyingAccountSelection = true;
+            try
+            {
+                if (allAccountsCheckBox != null)
+                    allAccountsCheckBox.IsChecked = true;
+                if (accountSelector != null)
+                    accountSelector.IsEnabled = false;
+            }
+            finally
+            {
+                isApplyingAccountSelection = previousApplyingAccountSelection;
+            }
         }
 
         private void RenderCalendar(TradeAccountBook book)
@@ -1740,7 +1859,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
-        private void RefreshDetail(TradeAccountBook book)
+        private void RefreshDetail(TradeAccountBook book, TradeQueryFilters filters)
         {
             DayBook day = book.GetDayBook(selectedDate);
 
@@ -1795,7 +1914,19 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
             }
 
-            dayGrid.ItemsSource = day.Rows.OrderByDescending(r => r.Time).ThenBy(r => r.Symbol).ToList();
+            if (string.Equals(GetTradeListViewMode(), ExecutionLegsViewText, StringComparison.OrdinalIgnoreCase))
+            {
+                dayGrid.ItemsSource = day.Rows.OrderByDescending(r => r.Time).ThenBy(r => r.Symbol).ToList();
+                return;
+            }
+
+            List<MatchedTradeRow> matchedTrades = service.BuildMatchedTradeRows(filters.AccountName)
+                .Where(filters.MatchesMatchedTrade)
+                .Where(r => TradeSessionCalendar_v3.ToTradingDate(r.ExitTime) == selectedDate.Date)
+                .OrderByDescending(r => r.ExitTime)
+                .ThenBy(r => r.Symbol)
+                .ToList();
+            dayGrid.ItemsSource = matchedTrades;
         }
 
         private Brush ChooseBrush(double value)
@@ -1998,6 +2129,43 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
 
             return TradeAccountBookBuilder_v3.Build(liveRecords, importedRecords);
+        }
+
+        public List<MatchedTradeRow> BuildMatchedTradeRows(string accountName)
+        {
+            EnsureInitialized();
+
+            List<PersistedExecutionRecord> liveRecords;
+            List<ImportedTradeRecord> importedRecords;
+
+            lock (sync)
+            {
+                liveRecords = ledgerByKey.Values
+                    .Where(r => IsLiveRecordOnOrAfterCutoff(r)
+                        && (string.IsNullOrEmpty(accountName) || string.Equals(r.AccountName, accountName, StringComparison.OrdinalIgnoreCase)))
+                    .OrderBy(r => r.AccountName)
+                    .ThenBy(r => r.Instrument)
+                    .ThenBy(r => r.Time)
+                    .ThenBy(r => r.ExecutionId)
+                    .ToList();
+
+                importedRecords = importedTradesByKey.Values
+                    .Where(r => IsImportedTradeOnOrAfterCutoff(r)
+                        && (string.IsNullOrEmpty(accountName) || string.Equals(r.AccountName, accountName, StringComparison.OrdinalIgnoreCase)))
+                    .OrderBy(r => r.AccountName)
+                    .ThenBy(r => r.Symbol)
+                    .ThenBy(r => r.ClosedOn)
+                    .ToList();
+            }
+
+            MatchedTradeBuildResult result = TradeAccountBookBuilder_v3.BuildMatchedTradeRows(liveRecords, importedRecords);
+            NinjaTrader.Code.Output.Process(
+                "TradeCalendar matched trades built: " + result.Rows.Count.ToString(CultureInfo.InvariantCulture)
+                + "; ID match rows: " + result.IdMatchRows.ToString(CultureInfo.InvariantCulture)
+                + "; fallback match rows: " + result.FallbackMatchRows.ToString(CultureInfo.InvariantCulture)
+                + "; unmatched executions: " + result.UnmatchedExecutions.ToString(CultureInfo.InvariantCulture),
+                PrintTo.OutputTab1);
+            return result.Rows;
         }
 
         public List<string> GetAvailableInstruments(string accountName)
@@ -2552,12 +2720,312 @@ namespace NinjaTrader.NinjaScript.AddOns
 
     public static class TradeAccountBookBuilder_v3
     {
+        private const double FallbackCommissionPerContract = 0.51d;
+
         public static TradeAccountBook Build(List<PersistedExecutionRecord> liveRecords, List<ImportedTradeRecord> importedTrades)
         {
             List<PersistedExecutionRecord> sanitizedLiveRecords = DeduplicateLiveRecords(liveRecords ?? new List<PersistedExecutionRecord>());
             TradeAccountBook book = BuildFromExecutions(sanitizedLiveRecords);
             AddImportedTrades(book, importedTrades ?? new List<ImportedTradeRecord>());
             return book;
+        }
+
+        public static MatchedTradeBuildResult BuildMatchedTradeRows(
+            List<PersistedExecutionRecord> liveRecords,
+            List<ImportedTradeRecord> importedTrades)
+        {
+            MatchedTradeBuildResult result = new MatchedTradeBuildResult();
+            List<PersistedExecutionRecord> sanitizedLiveRecords = DeduplicateLiveRecords(
+                liveRecords ?? new List<PersistedExecutionRecord>());
+
+            BuildMatchedTradesFromExecutions(sanitizedLiveRecords, result);
+            BuildMatchedTradesFromImportedTrades(importedTrades ?? new List<ImportedTradeRecord>(), result);
+
+            result.Rows.Sort((left, right) =>
+            {
+                int accountCompare = string.Compare(left.AccountName, right.AccountName, StringComparison.OrdinalIgnoreCase);
+                if (accountCompare != 0)
+                    return accountCompare;
+
+                int symbolCompare = string.Compare(left.Symbol, right.Symbol, StringComparison.OrdinalIgnoreCase);
+                if (symbolCompare != 0)
+                    return symbolCompare;
+
+                return left.ExitTime.CompareTo(right.ExitTime);
+            });
+
+            result.IdMatchRows = result.Rows.Count(r =>
+                string.Equals(r.MatchMethod, "Order ID", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(r.MatchMethod, "Order metadata", StringComparison.OrdinalIgnoreCase));
+            result.FallbackMatchRows = result.Rows.Count(r =>
+                string.Equals(r.MatchMethod, "Lot fallback", StringComparison.OrdinalIgnoreCase));
+            return result;
+        }
+
+        private static void BuildMatchedTradesFromExecutions(
+            List<PersistedExecutionRecord> records,
+            MatchedTradeBuildResult result)
+        {
+            Dictionary<string, List<MatchedOpenLot>> openLotsByAccountAndSymbol =
+                new Dictionary<string, List<MatchedOpenLot>>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, MatchedTradeRow> aggregatedRows =
+                new Dictionary<string, MatchedTradeRow>(StringComparer.OrdinalIgnoreCase);
+            int uniqueFallbackSequence = 0;
+            int invalidExecutions = 0;
+
+            foreach (PersistedExecutionRecord record in records
+                .OrderBy(r => r.AccountName)
+                .ThenBy(r => r.Instrument)
+                .ThenBy(r => r.Time)
+                .ThenBy(r => r.ExecutionId)
+                .ThenBy(r => r.OrderId))
+            {
+                if (record == null || record.Quantity <= 0 || string.IsNullOrWhiteSpace(record.Instrument))
+                {
+                    invalidExecutions++;
+                    continue;
+                }
+
+                int signedQty = GetSignedQuantity(record.Action, record.Quantity);
+                if (signedQty == 0)
+                {
+                    invalidExecutions++;
+                    continue;
+                }
+
+                string lotKey = string.Join("|", record.AccountName ?? string.Empty, record.Instrument);
+                List<MatchedOpenLot> openLots;
+                if (!openLotsByAccountAndSymbol.TryGetValue(lotKey, out openLots))
+                {
+                    openLots = new List<MatchedOpenLot>();
+                    openLotsByAccountAndSymbol[lotKey] = openLots;
+                }
+
+                int incomingSign = Math.Sign(signedQty);
+                int remaining = Math.Abs(signedQty);
+                double executionCommissionPerUnit = GetCommissionPerUnit(record);
+
+                while (remaining > 0)
+                {
+                    int openLotIndex = FindBestOpenLotIndex(openLots, incomingSign, record);
+                    if (openLotIndex < 0)
+                        break;
+
+                    MatchedOpenLot lot = openLots[openLotIndex];
+                    int matchedQty = Math.Min(remaining, lot.RemainingQty);
+                    string matchMethod = GetMatchMethod(lot, record);
+                    double commission = Round2((lot.EntryCommissionPerUnit + executionCommissionPerUnit) * matchedQty);
+                    double pnl = Round2(CalculateMatchedTradePnl(lot, record.Price, matchedQty, executionCommissionPerUnit));
+
+                    MatchedTradeRow row = new MatchedTradeRow
+                    {
+                        EntryTime = lot.EntryTime,
+                        ExitTime = record.Time,
+                        Symbol = record.Instrument,
+                        Direction = lot.Sign > 0 ? "Long" : "Short",
+                        Qty = matchedQty,
+                        EntryPrice = lot.EntryPrice,
+                        ExitPrice = record.Price,
+                        Commission = commission,
+                        Pnl = pnl,
+                        Source = "Live",
+                        AccountName = record.AccountName ?? string.Empty,
+                        EntryOrderId = lot.OrderId ?? string.Empty,
+                        ExitOrderId = record.OrderId ?? string.Empty,
+                        EntryExecutionIds = lot.ExecutionId ?? string.Empty,
+                        ExitExecutionIds = record.ExecutionId ?? string.Empty,
+                        MatchMethod = matchMethod
+                    };
+
+                    string aggregateKey = GetMatchedTradeAggregateKey(row, ref uniqueFallbackSequence);
+                    MatchedTradeRow existing;
+                    if (aggregatedRows.TryGetValue(aggregateKey, out existing))
+                        AggregateMatchedTrade(existing, row);
+                    else
+                    {
+                        aggregatedRows[aggregateKey] = row;
+                        result.Rows.Add(row);
+                    }
+
+                    lot.RemainingQty -= matchedQty;
+                    remaining -= matchedQty;
+
+                    if (lot.RemainingQty <= 0)
+                        openLots.RemoveAt(openLotIndex);
+                }
+
+                if (remaining > 0)
+                {
+                    openLots.Add(new MatchedOpenLot
+                    {
+                        EntryTime = record.Time,
+                        EntryPrice = record.Price,
+                        RemainingQty = remaining,
+                        Sign = incomingSign,
+                        EntryCommissionPerUnit = executionCommissionPerUnit,
+                        PointValue = record.PointValue,
+                        AccountName = record.AccountName ?? string.Empty,
+                        Symbol = record.Instrument,
+                        OrderId = record.OrderId ?? string.Empty,
+                        ExecutionId = record.ExecutionId ?? string.Empty,
+                        OrderName = record.OrderName ?? string.Empty
+                    });
+                }
+            }
+
+            result.UnmatchedExecutions = invalidExecutions
+                + openLotsByAccountAndSymbol.Values.Sum(lots => lots.Count);
+        }
+
+        private static void BuildMatchedTradesFromImportedTrades(
+            List<ImportedTradeRecord> importedTrades,
+            MatchedTradeBuildResult result)
+        {
+            foreach (ImportedTradeRecord trade in importedTrades)
+            {
+                if (trade == null || string.IsNullOrWhiteSpace(trade.Symbol))
+                    continue;
+
+                result.Rows.Add(new MatchedTradeRow
+                {
+                    EntryTime = trade.OpenedOn,
+                    ExitTime = trade.ClosedOn,
+                    Symbol = trade.Symbol,
+                    Direction = InferDirectionFromImportedAction(trade.Action),
+                    Qty = trade.Quantity,
+                    EntryPrice = trade.Price,
+                    ExitPrice = trade.Price,
+                    Commission = Round2(trade.Commission),
+                    Pnl = Round2(trade.Pnl),
+                    Source = "Imported",
+                    AccountName = trade.AccountName ?? string.Empty,
+                    EntryOrderId = string.Empty,
+                    ExitOrderId = string.Empty,
+                    EntryExecutionIds = string.Empty,
+                    ExitExecutionIds = string.Empty,
+                    MatchMethod = "Imported"
+                });
+            }
+        }
+
+        private static int FindBestOpenLotIndex(
+            List<MatchedOpenLot> openLots,
+            int incomingSign,
+            PersistedExecutionRecord closingRecord)
+        {
+            for (int i = 0; i < openLots.Count; i++)
+            {
+                if (openLots[i].Sign != incomingSign
+                    && !string.Equals(GetMatchMethod(openLots[i], closingRecord), "Lot fallback", StringComparison.OrdinalIgnoreCase))
+                    return i;
+            }
+
+            for (int i = 0; i < openLots.Count; i++)
+            {
+                if (openLots[i].Sign != incomingSign)
+                    return i;
+            }
+
+            return -1;
+        }
+
+        private static string GetMatchMethod(MatchedOpenLot lot, PersistedExecutionRecord closingRecord)
+        {
+            if (lot == null || closingRecord == null)
+                return "Lot fallback";
+
+            if (!string.IsNullOrWhiteSpace(lot.OrderId)
+                && !string.IsNullOrWhiteSpace(closingRecord.OrderId)
+                && string.Equals(lot.OrderId, closingRecord.OrderId, StringComparison.OrdinalIgnoreCase))
+                return "Order ID";
+
+            string entryRelationship = GetOrderRelationshipKey(lot.OrderName);
+            string exitRelationship = GetOrderRelationshipKey(closingRecord.OrderName);
+            if (!string.IsNullOrWhiteSpace(entryRelationship)
+                && string.Equals(entryRelationship, exitRelationship, StringComparison.OrdinalIgnoreCase))
+                return "Order metadata";
+
+            return "Lot fallback";
+        }
+
+        private static string GetOrderRelationshipKey(string orderName)
+        {
+            if (string.IsNullOrWhiteSpace(orderName))
+                return string.Empty;
+
+            StringBuilder normalized = new StringBuilder(orderName.Length);
+            foreach (char c in orderName.ToUpperInvariant())
+                normalized.Append(char.IsLetterOrDigit(c) ? c : ' ');
+
+            HashSet<string> relationshipNoise = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "ENTRY", "EXIT", "OPEN", "CLOSE", "LONG", "SHORT", "BUY", "SELL",
+                "BOT", "SLD", "BTC", "SSHORT", "STOP", "TARGET", "PROFIT", "LOSS", "ORDER"
+            };
+
+            string[] tokens = normalized.ToString()
+                .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            return string.Join(" ", tokens.Where(token => !relationshipNoise.Contains(token)));
+        }
+
+        private static string GetMatchedTradeAggregateKey(MatchedTradeRow row, ref int uniqueFallbackSequence)
+        {
+            if (!string.IsNullOrWhiteSpace(row.EntryOrderId) && !string.IsNullOrWhiteSpace(row.ExitOrderId))
+            {
+                return string.Join("|",
+                    row.AccountName ?? string.Empty,
+                    row.Symbol ?? string.Empty,
+                    row.Direction ?? string.Empty,
+                    row.EntryOrderId,
+                    row.ExitOrderId);
+            }
+
+            uniqueFallbackSequence++;
+            return "UNIQUE|" + uniqueFallbackSequence.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static void AggregateMatchedTrade(MatchedTradeRow target, MatchedTradeRow addition)
+        {
+            int totalQty = target.Qty + addition.Qty;
+            if (totalQty <= 0)
+                return;
+
+            target.EntryTime = target.EntryTime <= addition.EntryTime ? target.EntryTime : addition.EntryTime;
+            target.ExitTime = target.ExitTime >= addition.ExitTime ? target.ExitTime : addition.ExitTime;
+            target.EntryPrice = ((target.EntryPrice * target.Qty) + (addition.EntryPrice * addition.Qty)) / totalQty;
+            target.ExitPrice = ((target.ExitPrice * target.Qty) + (addition.ExitPrice * addition.Qty)) / totalQty;
+            target.Qty = totalQty;
+            target.Commission = Round2(target.Commission + addition.Commission);
+            target.Pnl = Round2(target.Pnl + addition.Pnl);
+            target.EntryExecutionIds = CombineIds(target.EntryExecutionIds, addition.EntryExecutionIds);
+            target.ExitExecutionIds = CombineIds(target.ExitExecutionIds, addition.ExitExecutionIds);
+            if (string.Equals(target.MatchMethod, "Lot fallback", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(addition.MatchMethod, "Lot fallback", StringComparison.OrdinalIgnoreCase))
+                target.MatchMethod = addition.MatchMethod;
+        }
+
+        private static string CombineIds(string existingIds, string additionalIds)
+        {
+            return string.Join(",",
+                (existingIds ?? string.Empty)
+                    .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Concat((additionalIds ?? string.Empty).Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                    .Select(id => id.Trim())
+                    .Where(id => id.Length > 0)
+                    .Distinct(StringComparer.OrdinalIgnoreCase));
+        }
+
+        private static double CalculateMatchedTradePnl(
+            MatchedOpenLot lot,
+            double exitPrice,
+            int qty,
+            double exitCommissionPerUnit)
+        {
+            double grossPerUnit = lot.Sign > 0
+                ? (exitPrice - lot.EntryPrice) * lot.PointValue
+                : (lot.EntryPrice - exitPrice) * lot.PointValue;
+            return (grossPerUnit * qty)
+                - ((lot.EntryCommissionPerUnit + exitCommissionPerUnit) * qty);
         }
 
         private static int GetActionPreferenceScoreForBuild(string action)
@@ -2636,7 +3104,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     openLotsBySymbol[symbol] = queue;
                 }
 
-                double execCommissionPerUnit = record.Quantity > 0 ? record.Commission / record.Quantity : 0d;
+                double execCommissionPerUnit = GetCommissionPerUnit(record);
                 int incomingSign = Math.Sign(signedQty);
                 int remaining = Math.Abs(signedQty);
 
@@ -2788,6 +3256,17 @@ namespace NinjaTrader.NinjaScript.AddOns
             double gross = grossPerUnit * qty;
             double commission = (lot.EntryCommissionPerUnit + exitCommissionPerUnit) * qty;
             return gross - commission;
+        }
+
+        private static double GetCommissionPerUnit(PersistedExecutionRecord record)
+        {
+            if (record == null || record.Quantity <= 0)
+                return 0d;
+
+            if (Math.Abs(record.Commission) > 0.000001)
+                return record.Commission / record.Quantity;
+
+            return FallbackCommissionPerContract;
         }
 
         private static int GetSignedQuantity(string action, int qty)
@@ -3231,6 +3710,96 @@ namespace NinjaTrader.NinjaScript.AddOns
         public string Symbol { get; set; }
     }
 
+    public class MatchedOpenLot
+    {
+        public DateTime EntryTime { get; set; }
+        public double EntryPrice { get; set; }
+        public int RemainingQty { get; set; }
+        public int Sign { get; set; }
+        public double EntryCommissionPerUnit { get; set; }
+        public double PointValue { get; set; }
+        public string AccountName { get; set; }
+        public string Symbol { get; set; }
+        public string OrderId { get; set; }
+        public string ExecutionId { get; set; }
+        public string OrderName { get; set; }
+    }
+
+    public class MatchedTradeRow
+    {
+        public DateTime EntryTime { get; set; }
+        public DateTime ExitTime { get; set; }
+        public string Symbol { get; set; }
+        public string Direction { get; set; }
+        public int Qty { get; set; }
+        public double EntryPrice { get; set; }
+        public double ExitPrice { get; set; }
+        public double Commission { get; set; }
+        public double Pnl { get; set; }
+        public string Source { get; set; }
+        public string AccountName { get; set; }
+        public string EntryOrderId { get; set; }
+        public string ExitOrderId { get; set; }
+        public string EntryExecutionIds { get; set; }
+        public string ExitExecutionIds { get; set; }
+        public string MatchMethod { get; set; }
+
+        [XmlIgnore]
+        public string EntryTimeDisplay
+        {
+            get { return EntryTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture); }
+            set { }
+        }
+
+        [XmlIgnore]
+        public string ExitTimeDisplay
+        {
+            get { return ExitTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture); }
+            set { }
+        }
+
+        [XmlIgnore]
+        public string PnlDisplay
+        {
+            get { return Pnl.ToString("N2", CultureInfo.InvariantCulture); }
+            set { }
+        }
+
+        [XmlIgnore]
+        public string EntryPriceDisplay
+        {
+            get { return EntryPrice.ToString("N2", CultureInfo.InvariantCulture); }
+            set { }
+        }
+
+        [XmlIgnore]
+        public string ExitPriceDisplay
+        {
+            get { return ExitPrice.ToString("N2", CultureInfo.InvariantCulture); }
+            set { }
+        }
+
+        [XmlIgnore]
+        public string CommissionDisplay
+        {
+            get { return Commission.ToString("N2", CultureInfo.InvariantCulture); }
+            set { }
+        }
+    }
+
+    public class MatchedTradeBuildResult
+    {
+        public List<MatchedTradeRow> Rows { get; private set; }
+        public int IdMatchRows { get; set; }
+        public int FallbackMatchRows { get; set; }
+        public int UnmatchedExecutions { get; set; }
+
+        public MatchedTradeBuildResult()
+        {
+            Rows = new List<MatchedTradeRow>();
+        }
+    }
+
     public class ExecutionBreakdownRow
     {
         public DateTime Time { get; set; }
@@ -3474,6 +4043,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         public DateTime? ToDate { get; set; }
         public DateTime CurrentMonth { get; set; }
         public DateTime SelectedDate { get; set; }
+        public string TradeListViewMode { get; set; }
 
         [XmlIgnore]
         private static string SettingsPath
@@ -3598,6 +4168,40 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (ToDate.HasValue && d > ToDate.Value.Date)
                 return false;
             return true;
+        }
+
+        public bool MatchesMatchedTrade(MatchedTradeRow row)
+        {
+            if (row == null)
+                return false;
+
+            if (!string.IsNullOrWhiteSpace(AccountName)
+                && !string.Equals(row.AccountName, AccountName, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (HasInstrumentFilter && !string.Equals(row.Symbol, Instrument, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (HasSourceFilter && !string.Equals(row.Source, Source, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (HasSideFilter && !string.Equals(row.Direction, Side, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (HasResultFilter)
+            {
+                string normalized = (Result ?? string.Empty).Trim().ToLowerInvariant();
+                if (normalized == "winning" && row.Pnl <= 0)
+                    return false;
+                if (normalized == "losing" && row.Pnl >= 0)
+                    return false;
+                if (normalized == "breakeven" && Math.Abs(row.Pnl) > 0.000001)
+                    return false;
+                if (normalized == "open")
+                    return false;
+            }
+
+            return MatchesDate(TradeSessionCalendar_v3.ToTradingDate(row.ExitTime));
         }
     }
 
