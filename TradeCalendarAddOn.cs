@@ -11,6 +11,7 @@
 #region Using declarations
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -198,6 +199,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private TextBlock dayPnlText;
         private StackPanel instrumentSummaryPanel;
         private ComboBox tradeListViewComboBox;
+        private Button exportCurrentTradeListCsvButton;
         private TextBlock tradesHeaderText;
         private DataGrid dayGrid;
         private TextBlock activeFilterSummaryText;
@@ -1092,6 +1094,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             tradeListHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             tradeListHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             tradeListHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            tradeListHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             tradesHeaderText = new TextBlock
             {
@@ -1120,12 +1123,18 @@ namespace NinjaTrader.NinjaScript.AddOns
             tradeListViewComboBox.SelectedItem = MatchedTradesViewText;
             tradeListViewComboBox.SelectionChanged += OnTradeListViewChanged;
 
+            exportCurrentTradeListCsvButton = MakeButton("Export CSV");
+            exportCurrentTradeListCsvButton.Margin = new Thickness(8, 0, 0, 0);
+            exportCurrentTradeListCsvButton.Click += OnExportCurrentTradeListCsvClick;
+
             tradeListHeader.Children.Add(tradesHeaderText);
             Grid.SetColumn(tradesHeaderText, 0);
             tradeListHeader.Children.Add(tradeListViewLabel);
             Grid.SetColumn(tradeListViewLabel, 1);
             tradeListHeader.Children.Add(tradeListViewComboBox);
             Grid.SetColumn(tradeListViewComboBox, 2);
+            tradeListHeader.Children.Add(exportCurrentTradeListCsvButton);
+            Grid.SetColumn(exportCurrentTradeListCsvButton, 3);
 
             dayGrid = new DataGrid
             {
@@ -1204,6 +1213,101 @@ namespace NinjaTrader.NinjaScript.AddOns
             ConfigureDayGridColumns();
             SaveCurrentUiState();
             RefreshAll();
+        }
+
+        private void OnExportCurrentTradeListCsvClick(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                string viewMode = GetTradeListViewMode();
+                List<MatchedTradeRow> matchedTrades = dayGrid.Items.Cast<object>().OfType<MatchedTradeRow>().ToList();
+                List<ExecutionBreakdownRow> executionLegs = dayGrid.Items.Cast<object>().OfType<ExecutionBreakdownRow>().ToList();
+                int rowCount = string.Equals(viewMode, ExecutionLegsViewText, StringComparison.OrdinalIgnoreCase)
+                    ? executionLegs.Count
+                    : matchedTrades.Count;
+
+                if (rowCount == 0)
+                {
+                    MessageBox.Show(
+                        "No rows to export for the selected day and filters.",
+                        "Trade Calendar Export",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                    return;
+                }
+
+                SaveFileDialog dialog = new SaveFileDialog
+                {
+                    Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*",
+                    Title = "Export current trade list to CSV",
+                    FileName = BuildCurrentTradeListExportFileName(),
+                    OverwritePrompt = true
+                };
+
+                bool? ok = dialog.ShowDialog();
+                if (ok != true)
+                    return;
+
+                if (string.Equals(viewMode, ExecutionLegsViewText, StringComparison.OrdinalIgnoreCase))
+                    CurrentTradeListCsvExporter.ExportExecutionLegs(dialog.FileName, executionLegs);
+                else
+                    CurrentTradeListCsvExporter.ExportMatchedTrades(dialog.FileName, matchedTrades);
+
+                MessageBox.Show(
+                    "Exported " + rowCount.ToString(CultureInfo.InvariantCulture) + " rows to:" + Environment.NewLine + dialog.FileName,
+                    "Trade Calendar Export",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                OpenExportFolder(dialog.FileName);
+            }
+            catch (Exception ex)
+            {
+                NinjaTrader.Code.Output.Process("TradeCalendar current trade list export error: " + ex, PrintTo.OutputTab1);
+                MessageBox.Show(
+                    "Export failed: " + ex.Message,
+                    "Trade Calendar Export",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        }
+
+        private void OpenExportFolder(string filePath)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(filePath))
+                    return;
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "explorer.exe",
+                    Arguments = "/select,\"" + Path.GetFullPath(filePath) + "\"",
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                NinjaTrader.Code.Output.Process("TradeCalendar open export folder error: " + ex, PrintTo.OutputTab1);
+            }
+        }
+
+        private string BuildCurrentTradeListExportFileName()
+        {
+            string instrument = GetComboSelection(instrumentComboBox, AllInstrumentsText);
+            if (string.Equals(instrument, AllInstrumentsText, StringComparison.OrdinalIgnoreCase))
+                instrument = "AllInstruments";
+
+            string viewMode = string.Equals(GetTradeListViewMode(), ExecutionLegsViewText, StringComparison.OrdinalIgnoreCase)
+                ? "ExecutionLegs"
+                : "MatchedTrades";
+
+            return "TradeCalendar_"
+                + CurrentTradeListCsvExporter.SanitizeFileNamePart(instrument)
+                + "_"
+                + selectedDate.ToString("yyyyMMdd", CultureInfo.InvariantCulture)
+                + "_"
+                + viewMode
+                + ".csv";
         }
 
         private string GetTradeListViewMode()
@@ -1390,6 +1494,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 && dayPnlText != null
                 && instrumentSummaryPanel != null
                 && tradeListViewComboBox != null
+                && exportCurrentTradeListCsvButton != null
                 && tradesHeaderText != null
                 && dayGrid != null
                 && activeFilterSummaryText != null
@@ -3312,6 +3417,115 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static double Round2(double value)
         {
             return Math.Round(value, 2, MidpointRounding.AwayFromZero);
+        }
+    }
+
+    public static class CurrentTradeListCsvExporter
+    {
+        public static void ExportMatchedTrades(string filePath, IEnumerable<MatchedTradeRow> rows)
+        {
+            EnsureOutputDirectory(filePath);
+
+            using (StreamWriter writer = new StreamWriter(filePath, false, new UTF8Encoding(true)))
+            {
+                writer.WriteLine("EntryTime,ExitTime,Symbol,Side,Qty,EntryPrice,ExitPrice,Commission,PnL,Source,AccountName,EntryOrderId,ExitOrderId,EntryExecutionIds,ExitExecutionIds,MatchMethod");
+
+                foreach (MatchedTradeRow row in rows ?? Enumerable.Empty<MatchedTradeRow>())
+                {
+                    if (row == null)
+                        continue;
+
+                    writer.WriteLine(string.Join(",",
+                        CsvEscape(FormatDateTime(row.EntryTime)),
+                        CsvEscape(FormatDateTime(row.ExitTime)),
+                        CsvEscape(row.Symbol),
+                        CsvEscape(row.Direction),
+                        row.Qty.ToString(CultureInfo.InvariantCulture),
+                        FormatNumber(row.EntryPrice),
+                        FormatNumber(row.ExitPrice),
+                        FormatNumber(row.Commission),
+                        FormatNumber(row.Pnl),
+                        CsvEscape(row.Source),
+                        CsvEscape(row.AccountName),
+                        CsvEscape(row.EntryOrderId),
+                        CsvEscape(row.ExitOrderId),
+                        CsvEscape(row.EntryExecutionIds),
+                        CsvEscape(row.ExitExecutionIds),
+                        CsvEscape(row.MatchMethod)));
+                }
+            }
+        }
+
+        public static void ExportExecutionLegs(string filePath, IEnumerable<ExecutionBreakdownRow> rows)
+        {
+            EnsureOutputDirectory(filePath);
+
+            using (StreamWriter writer = new StreamWriter(filePath, false, new UTF8Encoding(true)))
+            {
+                writer.WriteLine("Time,OpenedOn,ClosedOn,Symbol,Direction,Action,Qty,Price,Commission,PnL,Source");
+
+                foreach (ExecutionBreakdownRow row in rows ?? Enumerable.Empty<ExecutionBreakdownRow>())
+                {
+                    if (row == null)
+                        continue;
+
+                    writer.WriteLine(string.Join(",",
+                        CsvEscape(FormatDateTime(row.Time)),
+                        CsvEscape(FormatDateTime(row.OpenedOn)),
+                        CsvEscape(row.ClosedOn.HasValue ? FormatDateTime(row.ClosedOn.Value) : string.Empty),
+                        CsvEscape(row.Symbol),
+                        CsvEscape(row.Direction),
+                        CsvEscape(row.Action),
+                        row.Qty.ToString(CultureInfo.InvariantCulture),
+                        FormatNumber(row.Price),
+                        FormatNumber(row.Commission),
+                        row.Pnl.HasValue ? FormatNumber(row.Pnl.Value) : string.Empty,
+                        CsvEscape(row.Source)));
+                }
+            }
+        }
+
+        public static string SanitizeFileNamePart(string value)
+        {
+            string safe = string.IsNullOrWhiteSpace(value) ? "Unknown" : value.Trim();
+            HashSet<char> invalid = new HashSet<char>(Path.GetInvalidFileNameChars());
+            StringBuilder sanitized = new StringBuilder(safe.Length);
+
+            foreach (char c in safe)
+                sanitized.Append(invalid.Contains(c) || char.IsWhiteSpace(c) ? '_' : c);
+
+            string result = sanitized.ToString().Trim('_', '.');
+            return result.Length == 0 ? "Unknown" : result;
+        }
+
+        public static string CsvEscape(string value)
+        {
+            string safe = (value ?? string.Empty).Replace("\r", " ").Replace("\n", " ");
+            if (safe.Contains(",") || safe.Contains("\""))
+                return "\"" + safe.Replace("\"", "\"\"") + "\"";
+            return safe;
+        }
+
+        private static void EnsureOutputDirectory(string filePath)
+        {
+            if (string.IsNullOrWhiteSpace(filePath))
+                throw new ArgumentException("No output file was selected.", "filePath");
+
+            string directory = Path.GetDirectoryName(filePath);
+            if (!string.IsNullOrWhiteSpace(directory) && !Directory.Exists(directory))
+                Directory.CreateDirectory(directory);
+        }
+
+        private static string FormatDateTime(DateTime value)
+        {
+            return value == DateTime.MinValue
+                ? string.Empty
+                : value.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+        }
+
+        private static string FormatNumber(double value)
+        {
+            return value.ToString("R", CultureInfo.InvariantCulture);
         }
     }
 
