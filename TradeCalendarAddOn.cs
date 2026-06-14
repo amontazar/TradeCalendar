@@ -27,9 +27,16 @@ using System.Xml.Linq;
 using System.Xml.Serialization;
 using Microsoft.Win32;
 using NinjaTrader.Cbi;
+using NinjaTrader.Data;
 using NinjaTrader.Gui;
 using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
+using NtChart = NinjaTrader.Gui.Chart.Chart;
+using NtChartBars = NinjaTrader.Gui.Chart.ChartBars;
+using NtChartControl = NinjaTrader.Gui.Chart.ChartControl;
+using NtChartPanel = NinjaTrader.Gui.Chart.ChartPanel;
+using NtChartScale = NinjaTrader.Gui.Chart.ChartScale;
+using NtChartTab = NinjaTrader.Gui.Chart.ChartTab;
 #endregion
 
 namespace NinjaTrader.NinjaScript.AddOns
@@ -199,6 +206,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private TextBlock dayPnlText;
         private StackPanel instrumentSummaryPanel;
         private ComboBox tradeListViewComboBox;
+        private ComboBox chartMarkerTimeframeComboBox;
         private Button exportCurrentTradeListCsvButton;
         private TextBlock tradesHeaderText;
         private DataGrid dayGrid;
@@ -214,6 +222,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private DispatcherTimer accountRestoreTimer;
         private int accountRestoreAttempts;
         private bool isStartupAccountRestorePending;
+        private string lastChartLookupDetails;
 
         private const int AccountRestoreMaxAttempts = 20;
         private static readonly TimeSpan AccountRestoreInterval = TimeSpan.FromMilliseconds(250);
@@ -231,6 +240,18 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AllResultsText = "All results";
         private const string MatchedTradesViewText = "Matched Trades";
         private const string ExecutionLegsViewText = "Execution Legs";
+        private const string DefaultChartMarkerTimeframeText = "5 Minute";
+        private static readonly string[] ChartMarkerTimeframes =
+        {
+            "10 Second",
+            "30 Second",
+            "1 Minute",
+            "3 Minute",
+            DefaultChartMarkerTimeframeText,
+            "15 Minute",
+            "30 Minute",
+            "60 Minute"
+        };
 
         public TradeCalendarControl_v3()
         {
@@ -511,6 +532,20 @@ namespace NinjaTrader.NinjaScript.AddOns
                 isStartupAccountRestorePending = false;
             }
 
+            if (allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true)
+            {
+                bool previousApplyingAccountSelection = isApplyingAccountSelection;
+                isApplyingAccountSelection = true;
+                try
+                {
+                    allAccountsCheckBox.IsChecked = false;
+                }
+                finally
+                {
+                    isApplyingAccountSelection = previousApplyingAccountSelection;
+                }
+            }
+
             lastSelectedAccountName = selectedAccountName;
             SaveCurrentUiState();
             RefreshFilterChoices();
@@ -549,7 +584,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
 
             bool useAllAccounts = allAccountsCheckBox.IsChecked == true;
-            accountSelector.IsEnabled = !useAllAccounts;
+            accountSelector.IsEnabled = true;
 
             if (!useAllAccounts)
             {
@@ -586,7 +621,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return;
 
             if (accountSelector != null && allAccountsCheckBox != null)
-                accountSelector.IsEnabled = allAccountsCheckBox.IsChecked != true;
+                accountSelector.IsEnabled = true;
 
             SaveCurrentUiState();
             RefreshAll();
@@ -694,7 +729,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 else
                     instrumentComboBox.SelectedIndex = 0;
 
-                accountSelector.IsEnabled = allAccountsCheckBox.IsChecked != true;
+                accountSelector.IsEnabled = true;
             }
             finally
             {
@@ -710,7 +745,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             lastSelectedAccountName = GetSavedAccountName(state);
             bool useAllAccounts = state != null && state.AllAccounts;
             allAccountsCheckBox.IsChecked = useAllAccounts;
-            accountSelector.IsEnabled = !useAllAccounts;
+            accountSelector.IsEnabled = true;
             pendingRestoreAccountName = null;
             isStartupAccountRestorePending = false;
             StopAccountRestoreTimer();
@@ -749,6 +784,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 ? MatchedTradesViewText
                 : state.TradeListViewMode;
             ApplyComboSelection(tradeListViewComboBox, wantedTradeListView);
+            string wantedChartTimeframe = state == null || string.IsNullOrWhiteSpace(state.ChartMarkerTimeframe)
+                ? DefaultChartMarkerTimeframeText
+                : state.ChartMarkerTimeframe;
+            ApplyComboSelection(chartMarkerTimeframeComboBox,
+                ChartMarkerTimeframes.Any(item => string.Equals(item, wantedChartTimeframe, StringComparison.OrdinalIgnoreCase))
+                    ? wantedChartTimeframe
+                    : DefaultChartMarkerTimeframeText);
             ConfigureDayGridColumns();
         }
 
@@ -788,7 +830,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                     ToDate = toDatePicker != null ? toDatePicker.SelectedDate : null,
                     CurrentMonth = currentMonth,
                     SelectedDate = selectedDate,
-                    TradeListViewMode = GetTradeListViewMode()
+                    TradeListViewMode = GetTradeListViewMode(),
+                    ChartMarkerTimeframe = GetChartMarkerTimeframe()
                 };
                 state.Save();
                 NinjaTrader.Code.Output.Process(
@@ -1095,6 +1138,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             tradeListHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             tradeListHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             tradeListHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            tradeListHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            tradeListHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             tradesHeaderText = new TextBlock
             {
@@ -1123,6 +1168,25 @@ namespace NinjaTrader.NinjaScript.AddOns
             tradeListViewComboBox.SelectedItem = MatchedTradesViewText;
             tradeListViewComboBox.SelectionChanged += OnTradeListViewChanged;
 
+            TextBlock chartTimeframeLabel = new TextBlock
+            {
+                Text = "Chart Timeframe",
+                Margin = new Thickness(12, 0, 8, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = neutralBrush
+            };
+
+            chartMarkerTimeframeComboBox = new ComboBox
+            {
+                Width = 110,
+                MinHeight = 26,
+                VerticalContentAlignment = VerticalAlignment.Center
+            };
+            foreach (string timeframe in ChartMarkerTimeframes)
+                chartMarkerTimeframeComboBox.Items.Add(timeframe);
+            chartMarkerTimeframeComboBox.SelectedItem = DefaultChartMarkerTimeframeText;
+            chartMarkerTimeframeComboBox.SelectionChanged += OnChartMarkerTimeframeChanged;
+
             exportCurrentTradeListCsvButton = MakeButton("Export CSV");
             exportCurrentTradeListCsvButton.Margin = new Thickness(8, 0, 0, 0);
             exportCurrentTradeListCsvButton.Click += OnExportCurrentTradeListCsvClick;
@@ -1133,8 +1197,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             Grid.SetColumn(tradeListViewLabel, 1);
             tradeListHeader.Children.Add(tradeListViewComboBox);
             Grid.SetColumn(tradeListViewComboBox, 2);
+            tradeListHeader.Children.Add(chartTimeframeLabel);
+            Grid.SetColumn(chartTimeframeLabel, 3);
+            tradeListHeader.Children.Add(chartMarkerTimeframeComboBox);
+            Grid.SetColumn(chartMarkerTimeframeComboBox, 4);
             tradeListHeader.Children.Add(exportCurrentTradeListCsvButton);
-            Grid.SetColumn(exportCurrentTradeListCsvButton, 3);
+            Grid.SetColumn(exportCurrentTradeListCsvButton, 5);
 
             dayGrid = new DataGrid
             {
@@ -1149,6 +1217,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 AlternationCount = 2
             };
             dayGrid.LoadingRow += OnDayGridLoadingRow;
+            dayGrid.MouseDoubleClick += OnDayGridMouseDoubleClick;
 
             ConfigureDayGridColumns();
 
@@ -1213,6 +1282,402 @@ namespace NinjaTrader.NinjaScript.AddOns
             ConfigureDayGridColumns();
             SaveCurrentUiState();
             RefreshAll();
+        }
+
+        private void OnChartMarkerTimeframeChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (isApplyingUiState || !IsLoaded || !IsUiReady())
+                return;
+
+            SaveCurrentUiState();
+        }
+
+        private string GetChartMarkerTimeframe()
+        {
+            string selected = GetComboSelection(chartMarkerTimeframeComboBox, DefaultChartMarkerTimeframeText);
+            return ChartMarkerTimeframes.Any(item => string.Equals(item, selected, StringComparison.OrdinalIgnoreCase))
+                ? selected
+                : DefaultChartMarkerTimeframeText;
+        }
+
+        private void OnDayGridMouseDoubleClick(object sender, MouseButtonEventArgs e)
+        {
+            try
+            {
+                DataGridRow clickedGridRow = ItemsControl.ContainerFromElement(
+                    dayGrid,
+                    e.OriginalSource as DependencyObject) as DataGridRow;
+                if (clickedGridRow == null)
+                    return;
+
+                if (!string.Equals(GetTradeListViewMode(), MatchedTradesViewText, StringComparison.OrdinalIgnoreCase))
+                {
+                    MessageBox.Show(
+                        "Chart marking is available only from the Matched Trades view.",
+                        "Trade Calendar Chart Marker",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                    return;
+                }
+
+                MatchedTradeRow row = clickedGridRow.Item as MatchedTradeRow;
+                if (row == null)
+                {
+                    MessageBox.Show(
+                        "Please select a matched trade row first.",
+                        "Trade Calendar Chart Marker",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                    return;
+                }
+
+                if (row.EntryTime == DateTime.MinValue
+                    || row.ExitTime == DateTime.MinValue
+                    || double.IsNaN(row.EntryPrice)
+                    || double.IsInfinity(row.EntryPrice)
+                    || double.IsNaN(row.ExitPrice)
+                    || double.IsInfinity(row.ExitPrice))
+                {
+                    MessageBox.Show(
+                        "This matched trade does not have complete entry/exit information.",
+                        "Trade Calendar Chart Marker",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    return;
+                }
+
+                string timeframeText = GetChartMarkerTimeframe();
+                OpenChartMatch chartMatch = FindOpenChartForTrade(row.Symbol, timeframeText);
+                if (chartMatch == null)
+                {
+                    MessageBox.Show(
+                        "No open chart found for " + row.Symbol + " on " + timeframeText + "." + Environment.NewLine
+                        + "Please open that chart and try again."
+                        + (string.IsNullOrWhiteSpace(lastChartLookupDetails)
+                            ? string.Empty
+                            : Environment.NewLine + Environment.NewLine + lastChartLookupDetails),
+                        "Trade Calendar Chart Marker",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                    return;
+                }
+
+                MarkTradeOnChart(chartMatch, row, timeframeText);
+                e.Handled = true;
+            }
+            catch (Exception ex)
+            {
+                NinjaTrader.Code.Output.Process("TradeCalendar chart marker error: " + ex, PrintTo.OutputTab1);
+                MessageBox.Show(
+                    "Unable to mark the matched trade on the chart: " + ex.Message,
+                    "Trade Calendar Chart Marker",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        }
+
+        private OpenChartMatch FindOpenChartForTrade(string symbol, string timeframeText)
+        {
+            BarsPeriodType periodType;
+            int periodValue;
+            if (!ChartMarkerTimeframeParser.TryParse(timeframeText, out periodType, out periodValue))
+                return null;
+
+            List<NtChart> openCharts;
+            List<string> chartDescriptions = new List<string>();
+            try
+            {
+                lock (NinjaTrader.Core.Globals.AllWindows)
+                {
+                    openCharts = NinjaTrader.Core.Globals.AllWindows
+                        .OfType<NtChart>()
+                        .ToList();
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    "Chart lookup failed while reading NinjaTrader's open-window list: " + ex.Message,
+                    ex);
+            }
+
+            foreach (NtChart chart in openCharts)
+            {
+                OpenChartMatch match = null;
+                Action inspectChart = () =>
+                {
+                    NtChartControl activeChartControl = chart.ActiveChartControl;
+                    if (activeChartControl != null)
+                    {
+                        chartDescriptions.Add(DescribeChartControl(activeChartControl));
+                        if (DoesChartMatch(activeChartControl, symbol, periodType, periodValue))
+                        {
+                            match = new OpenChartMatch
+                            {
+                                ChartWindow = chart,
+                                ChartTab = activeChartControl.ChartTab,
+                                ChartControl = activeChartControl,
+                                ChartTabIndex = chart.MainTabControl != null
+                                    ? (int?)chart.MainTabControl.SelectedIndex
+                                    : null
+                            };
+                            return;
+                        }
+                    }
+
+                    if (chart.MainTabControl == null)
+                        return;
+
+                    for (int tabIndex = 0; tabIndex < chart.MainTabControl.Items.Count; tabIndex++)
+                    {
+                        object item = chart.MainTabControl.Items[tabIndex];
+                        NtChartTab chartTab = GetChartTab(item);
+                        if (chartTab == null)
+                            continue;
+
+                        NtChartControl chartControl = chartTab.ChartControl;
+                        string description = DescribeChartControl(chartControl);
+                        if (!chartDescriptions.Contains(description))
+                            chartDescriptions.Add(description);
+
+                        if (!DoesChartMatch(chartTab, symbol, periodType, periodValue))
+                            continue;
+
+                        match = new OpenChartMatch
+                        {
+                            ChartWindow = chart,
+                            ChartTab = chartTab,
+                            ChartControl = chartControl,
+                            ChartTabIndex = tabIndex
+                        };
+                        break;
+                    }
+                };
+
+                try
+                {
+                    if (chart.Dispatcher.CheckAccess())
+                        inspectChart();
+                    else
+                        chart.Dispatcher.Invoke(inspectChart);
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException(
+                        "Chart lookup failed while inspecting a chart tab: " + ex.Message,
+                        ex);
+                }
+
+                if (match != null)
+                {
+                    lastChartLookupDetails = null;
+                    return match;
+                }
+            }
+
+            lastChartLookupDetails = openCharts.Count == 0
+                ? "NinjaTrader reported 0 open chart windows."
+                : "Detected chart windows: " + openCharts.Count.ToString(CultureInfo.InvariantCulture)
+                    + Environment.NewLine
+                    + (chartDescriptions.Count == 0
+                        ? "No active chart controls were available."
+                        : string.Join(Environment.NewLine, chartDescriptions.Distinct()));
+            return null;
+        }
+
+        private NtChartTab GetChartTab(object item)
+        {
+            NtChartTab chartTab = item as NtChartTab;
+            if (chartTab != null)
+                return chartTab;
+
+            TabItem tabItem = item as TabItem;
+            return tabItem != null ? tabItem.Content as NtChartTab : null;
+        }
+
+        private bool DoesChartMatch(
+            NtChartControl chartControl,
+            string symbol,
+            BarsPeriodType periodType,
+            int periodValue)
+        {
+            if (chartControl == null)
+                return false;
+
+            return DoesChartMatch(
+                chartControl.Instrument,
+                chartControl.BarsPeriod,
+                symbol,
+                periodType,
+                periodValue);
+        }
+
+        private bool DoesChartMatch(
+            NtChartTab chartTab,
+            string symbol,
+            BarsPeriodType periodType,
+            int periodValue)
+        {
+            if (chartTab == null)
+                return false;
+
+            NtChartControl chartControl = chartTab.ChartControl;
+            Instrument instrument = chartControl != null && chartControl.Instrument != null
+                ? chartControl.Instrument
+                : chartTab.Instrument;
+            BarsPeriod barsPeriod = chartControl != null && chartControl.BarsPeriod != null
+                ? chartControl.BarsPeriod
+                : chartTab.BarsPeriod;
+            return DoesChartMatch(instrument, barsPeriod, symbol, periodType, periodValue);
+        }
+
+        private bool DoesChartMatch(
+            Instrument instrument,
+            BarsPeriod barsPeriod,
+            string symbol,
+            BarsPeriodType periodType,
+            int periodValue)
+        {
+            if (instrument == null)
+                return false;
+
+            string masterName = instrument.MasterInstrument != null
+                ? instrument.MasterInstrument.Name
+                : string.Empty;
+            bool instrumentMatches = string.Equals(symbol, masterName, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(symbol, instrument.FullName, StringComparison.OrdinalIgnoreCase)
+                || (!string.IsNullOrWhiteSpace(instrument.FullName)
+                    && instrument.FullName.StartsWith(symbol + " ", StringComparison.OrdinalIgnoreCase));
+            return barsPeriod != null
+                && instrumentMatches
+                && barsPeriod.BarsPeriodType == periodType
+                && barsPeriod.Value == periodValue;
+        }
+
+        private string DescribeChartControl(NtChartControl chartControl)
+        {
+            if (chartControl == null)
+                return "Chart control: unavailable";
+
+            Instrument instrument = chartControl.Instrument;
+            BarsPeriod barsPeriod = chartControl.BarsPeriod;
+            string instrumentName = instrument != null
+                ? instrument.FullName ?? instrument.ToString()
+                : "(no instrument)";
+            string interval = barsPeriod != null
+                ? barsPeriod.Value.ToString(CultureInfo.InvariantCulture) + " " + barsPeriod.BarsPeriodType
+                : "(no interval)";
+            return "- " + instrumentName + " / " + interval;
+        }
+
+        private void MarkTradeOnChart(OpenChartMatch chartMatch, MatchedTradeRow row, string timeframeText)
+        {
+            if (chartMatch == null || chartMatch.ChartWindow == null || chartMatch.ChartControl == null)
+                return;
+
+            NtChart chart = chartMatch.ChartWindow;
+            Action markChart = () => MarkTradeOnChartCore(chartMatch, row, timeframeText);
+            try
+            {
+                if (chart.Dispatcher.CheckAccess())
+                    markChart();
+                else
+                    chart.Dispatcher.Invoke(markChart);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    "Chart marker rendering failed: " + ex.Message,
+                    ex);
+            }
+        }
+
+        private void MarkTradeOnChartCore(OpenChartMatch chartMatch, MatchedTradeRow row, string timeframeText)
+        {
+            NtChart chart = chartMatch.ChartWindow;
+            if (chart.MainTabControl != null)
+            {
+                if (chartMatch.ChartTabIndex.HasValue
+                    && chartMatch.ChartTabIndex.Value >= 0
+                    && chartMatch.ChartTabIndex.Value < chart.MainTabControl.Items.Count)
+                {
+                    chart.MainTabControl.SelectedIndex = chartMatch.ChartTabIndex.Value;
+                }
+                else if (chartMatch.ChartTab != null)
+                {
+                    object matchingTabItem = chart.MainTabControl.Items
+                        .Cast<object>()
+                        .FirstOrDefault(item => ReferenceEquals(GetChartTab(item), chartMatch.ChartTab));
+                    if (matchingTabItem != null)
+                        chart.MainTabControl.SelectedItem = matchingTabItem;
+                }
+            }
+            chart.UpdateLayout();
+
+            NtChartControl chartControl = chartMatch.ChartControl
+                ?? (chartMatch.ChartTab != null ? chartMatch.ChartTab.ChartControl : null)
+                ?? chart.ActiveChartControl;
+            if (chartControl == null)
+                throw new InvalidOperationException("The matching chart is not ready.");
+
+            CenterChartOnTrade(chartControl, row.EntryTime, row.ExitTime);
+
+            TradeChartMarkerOverlay overlay = chartControl.Children
+                .OfType<TradeChartMarkerOverlay>()
+                .FirstOrDefault();
+            if (overlay == null)
+            {
+                overlay = new TradeChartMarkerOverlay(chartControl)
+                {
+                    HorizontalAlignment = HorizontalAlignment.Stretch,
+                    VerticalAlignment = VerticalAlignment.Stretch,
+                    IsHitTestVisible = false
+                };
+                Grid.SetRowSpan(overlay, Math.Max(1, chartControl.RowDefinitions.Count));
+                Grid.SetColumnSpan(overlay, Math.Max(1, chartControl.ColumnDefinitions.Count));
+                Panel.SetZIndex(overlay, int.MaxValue);
+                chartControl.Children.Add(overlay);
+            }
+
+            overlay.AddOrUpdate(new TradeChartMarkerRequest
+            {
+                Symbol = row.Symbol,
+                Direction = row.Direction,
+                Qty = row.Qty,
+                EntryTime = row.EntryTime,
+                ExitTime = row.ExitTime,
+                EntryPrice = row.EntryPrice,
+                ExitPrice = row.ExitPrice,
+                Pnl = row.Pnl,
+                TimeframeText = timeframeText
+            });
+
+            if (chart.WindowState == WindowState.Minimized)
+                chart.WindowState = WindowState.Normal;
+            if (!chart.IsVisible)
+                chart.Show();
+            chart.Activate();
+            chart.Focus();
+            chartControl.InvalidateVisual();
+        }
+
+        private void CenterChartOnTrade(NtChartControl chartControl, DateTime entryTime, DateTime exitTime)
+        {
+            if (chartControl == null || entryTime == DateTime.MinValue)
+                return;
+
+            DateTime centerTime = exitTime > entryTime
+                ? entryTime.AddTicks((exitTime - entryTime).Ticks / 2)
+                : entryTime;
+            double centerSlot = chartControl.GetSlotIndexByTime(centerTime);
+            if (double.IsNaN(centerSlot) || double.IsInfinity(centerSlot))
+                return;
+
+            int visibleSlots = Math.Max(20, chartControl.SlotsPainted);
+            int lastVisibleSlot = (int)Math.Ceiling(centerSlot + (visibleSlots / 2d));
+            chartControl.LastSlotPainted = Math.Max(0, lastVisibleSlot);
+            chartControl.UpdateLayout();
+            chartControl.InvalidateVisual();
         }
 
         private void OnExportCurrentTradeListCsvClick(object sender, RoutedEventArgs e)
@@ -1494,6 +1959,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 && dayPnlText != null
                 && instrumentSummaryPanel != null
                 && tradeListViewComboBox != null
+                && chartMarkerTimeframeComboBox != null
                 && exportCurrentTradeListCsvButton != null
                 && tradesHeaderText != null
                 && dayGrid != null
@@ -1678,12 +2144,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             StopAccountRestoreTimer();
             isStartupAccountRestorePending = false;
             pendingRestoreAccountName = null;
-            SelectFallbackAccountOrAllAccounts();
+            if (!TrySelectFirstAvailableAccount())
+                SelectFallbackAccountOrAllAccounts();
             SaveCurrentUiState();
             RefreshFilterChoices();
             RefreshAll();
             NinjaTrader.Code.Output.Process(
-                "TradeCalendar account restore failed after retries; fallback to All accounts.",
+                allAccountsCheckBox != null && allAccountsCheckBox.IsChecked == true
+                    ? "TradeCalendar account restore failed after retries; fallback to All accounts."
+                    : "TradeCalendar account restore failed after retries; selected the first available account.",
                 PrintTo.OutputTab1);
         }
 
@@ -1825,7 +2294,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (allAccountsCheckBox != null)
                     allAccountsCheckBox.IsChecked = true;
                 if (accountSelector != null)
-                    accountSelector.IsEnabled = false;
+                    accountSelector.IsEnabled = true;
             }
             finally
             {
@@ -3420,6 +3889,262 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
     }
 
+    public static class ChartMarkerTimeframeParser
+    {
+        public static bool TryParse(string timeframeText, out BarsPeriodType periodType, out int periodValue)
+        {
+            periodType = BarsPeriodType.Minute;
+            periodValue = 0;
+
+            string normalized = (timeframeText ?? string.Empty).Trim();
+            switch (normalized)
+            {
+                case "10 Second":
+                    periodType = BarsPeriodType.Second;
+                    periodValue = 10;
+                    return true;
+                case "30 Second":
+                    periodType = BarsPeriodType.Second;
+                    periodValue = 30;
+                    return true;
+                case "1 Minute":
+                    periodValue = 1;
+                    return true;
+                case "3 Minute":
+                    periodValue = 3;
+                    return true;
+                case "5 Minute":
+                    periodValue = 5;
+                    return true;
+                case "15 Minute":
+                    periodValue = 15;
+                    return true;
+                case "30 Minute":
+                    periodValue = 30;
+                    return true;
+                case "60 Minute":
+                    periodValue = 60;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+    }
+
+    public class OpenChartMatch
+    {
+        public NtChart ChartWindow { get; set; }
+        public NtChartTab ChartTab { get; set; }
+        public NtChartControl ChartControl { get; set; }
+        public int? ChartTabIndex { get; set; }
+    }
+
+    public class TradeChartMarkerRequest
+    {
+        public string Symbol { get; set; }
+        public string Direction { get; set; }
+        public int Qty { get; set; }
+        public DateTime EntryTime { get; set; }
+        public DateTime ExitTime { get; set; }
+        public double EntryPrice { get; set; }
+        public double ExitPrice { get; set; }
+        public double Pnl { get; set; }
+        public string TimeframeText { get; set; }
+
+        [XmlIgnore]
+        public string StableKey
+        {
+            get
+            {
+                return string.Join("|",
+                    Symbol ?? string.Empty,
+                    EntryTime.Ticks.ToString(CultureInfo.InvariantCulture),
+                    ExitTime.Ticks.ToString(CultureInfo.InvariantCulture));
+            }
+        }
+    }
+
+    public class TradeChartMarkerOverlay : FrameworkElement
+    {
+        private readonly NtChartControl chartControl;
+        private readonly Dictionary<string, TradeChartMarkerRequest> requests =
+            new Dictionary<string, TradeChartMarkerRequest>(StringComparer.OrdinalIgnoreCase);
+        private readonly DispatcherTimer redrawTimer;
+
+        public TradeChartMarkerOverlay(NtChartControl chartControl)
+        {
+            this.chartControl = chartControl;
+            ClipToBounds = true;
+
+            redrawTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(500)
+            };
+            redrawTimer.Tick += (sender, args) => InvalidateVisual();
+            Loaded += (sender, args) => redrawTimer.Start();
+            Unloaded += (sender, args) => redrawTimer.Stop();
+        }
+
+        public void AddOrUpdate(TradeChartMarkerRequest request)
+        {
+            if (request == null)
+                return;
+
+            requests[request.StableKey] = request;
+            InvalidateVisual();
+        }
+
+        [XmlIgnore]
+        public int MarkerCount
+        {
+            get { return requests.Count; }
+        }
+
+        protected override void OnRender(DrawingContext drawingContext)
+        {
+            base.OnRender(drawingContext);
+
+            if (chartControl == null
+                || chartControl.PrimaryBars == null
+                || chartControl.PrimaryBars.ChartPanel == null
+                || requests.Count == 0)
+                return;
+
+            NtChartBars primaryBars = chartControl.PrimaryBars;
+            NtChartPanel chartPanel = primaryBars.ChartPanel;
+            NtChartScale chartScale = GetPrimaryChartScale(primaryBars, chartPanel);
+            if (chartScale == null || chartPanel.W <= 0 || chartPanel.H <= 0)
+                return;
+
+            Rect clipRect = new Rect(chartPanel.X, chartPanel.Y, chartPanel.W, chartPanel.H);
+            drawingContext.PushClip(new RectangleGeometry(clipRect));
+            try
+            {
+                foreach (TradeChartMarkerRequest request in requests.Values)
+                    DrawTrade(drawingContext, chartPanel, chartScale, request);
+            }
+            finally
+            {
+                drawingContext.Pop();
+            }
+        }
+
+        private NtChartScale GetPrimaryChartScale(NtChartBars primaryBars, NtChartPanel chartPanel)
+        {
+            if (chartPanel == null || chartPanel.Scales == null || chartPanel.Scales.Count == 0)
+                return null;
+
+            try
+            {
+                if (primaryBars != null && primaryBars.Properties != null)
+                {
+                    NtChartScale scale = chartPanel.Scales[primaryBars.Properties.ScaleJustification];
+                    if (scale != null)
+                        return scale;
+                }
+            }
+            catch
+            {
+            }
+
+            return chartPanel.Scales[0];
+        }
+
+        private void DrawTrade(
+            DrawingContext drawingContext,
+            NtChartPanel chartPanel,
+            NtChartScale chartScale,
+            TradeChartMarkerRequest request)
+        {
+            double entryX = chartControl.GetXByTime(request.EntryTime);
+            double exitX = chartControl.GetXByTime(request.ExitTime);
+            double entryY = chartScale.GetYByValueWpf(request.EntryPrice);
+            double exitY = chartScale.GetYByValueWpf(request.ExitPrice);
+
+            Point entryPoint = new Point(entryX, entryY);
+            Point exitPoint = new Point(exitX, exitY);
+
+            Brush entryBrush = Brushes.ForestGreen;
+            Brush exitBrush = request.Pnl > 0
+                ? Brushes.ForestGreen
+                : request.Pnl < 0 ? Brushes.Firebrick : Brushes.DimGray;
+
+            SolidColorBrush lineBrush = new SolidColorBrush(Color.FromArgb(125, 70, 130, 180));
+            lineBrush.Freeze();
+            drawingContext.DrawLine(new Pen(lineBrush, 1.5), entryPoint, exitPoint);
+
+            DrawEntryMarker(drawingContext, entryPoint, request.Direction, entryBrush);
+            DrawExitMarker(drawingContext, exitPoint, exitBrush);
+
+            string entryLabel = "ENTRY " + (request.Direction ?? string.Empty) + " x"
+                + request.Qty.ToString(CultureInfo.InvariantCulture);
+            string exitLabel = "EXIT " + (request.Pnl >= 0 ? "+" : "-")
+                + "$" + Math.Abs(request.Pnl).ToString("N2", CultureInfo.InvariantCulture);
+
+            DrawLabel(drawingContext, entryLabel, entryPoint.X + 8, entryPoint.Y - 24, entryBrush);
+            DrawLabel(drawingContext, exitLabel, exitPoint.X + 8, exitPoint.Y + 6, exitBrush);
+        }
+
+        private static void DrawEntryMarker(
+            DrawingContext drawingContext,
+            Point point,
+            string direction,
+            Brush brush)
+        {
+            bool isShort = string.Equals(direction, "Short", StringComparison.OrdinalIgnoreCase);
+            StreamGeometry geometry = new StreamGeometry();
+            using (StreamGeometryContext context = geometry.Open())
+            {
+                if (isShort)
+                {
+                    context.BeginFigure(new Point(point.X, point.Y + 9), true, true);
+                    context.LineTo(new Point(point.X - 7, point.Y - 4), true, false);
+                    context.LineTo(new Point(point.X + 7, point.Y - 4), true, false);
+                }
+                else
+                {
+                    context.BeginFigure(new Point(point.X, point.Y - 9), true, true);
+                    context.LineTo(new Point(point.X - 7, point.Y + 4), true, false);
+                    context.LineTo(new Point(point.X + 7, point.Y + 4), true, false);
+                }
+            }
+            geometry.Freeze();
+            drawingContext.DrawGeometry(brush, new Pen(Brushes.White, 1), geometry);
+        }
+
+        private static void DrawExitMarker(DrawingContext drawingContext, Point point, Brush brush)
+        {
+            StreamGeometry geometry = new StreamGeometry();
+            using (StreamGeometryContext context = geometry.Open())
+            {
+                context.BeginFigure(new Point(point.X, point.Y - 7), true, true);
+                context.LineTo(new Point(point.X + 7, point.Y), true, false);
+                context.LineTo(new Point(point.X, point.Y + 7), true, false);
+                context.LineTo(new Point(point.X - 7, point.Y), true, false);
+            }
+            geometry.Freeze();
+            drawingContext.DrawGeometry(brush, new Pen(Brushes.White, 1), geometry);
+        }
+
+        private static void DrawLabel(
+            DrawingContext drawingContext,
+            string text,
+            double x,
+            double y,
+            Brush brush)
+        {
+            FormattedText formattedText = new FormattedText(
+                text,
+                CultureInfo.InvariantCulture,
+                FlowDirection.LeftToRight,
+                new Typeface("Segoe UI"),
+                12,
+                brush,
+                1.0);
+            drawingContext.DrawText(formattedText, new Point(x, y));
+        }
+    }
+
     public static class CurrentTradeListCsvExporter
     {
         public static void ExportMatchedTrades(string filePath, IEnumerable<MatchedTradeRow> rows)
@@ -4258,6 +4983,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         public DateTime CurrentMonth { get; set; }
         public DateTime SelectedDate { get; set; }
         public string TradeListViewMode { get; set; }
+        public string ChartMarkerTimeframe { get; set; }
 
         [XmlIgnore]
         private static string SettingsPath
